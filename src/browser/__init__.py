@@ -86,10 +86,10 @@ async def create_browser(
                 **launch_kwargs,
             )
             browser = ctx.browser()
-            return {"ok": True, "browser": browser, "context": ctx}
+            return {"ok": True, "browser": browser, "context": ctx, "playwright": pw}
 
         browser = await pw.chromium.launch(**launch_kwargs)
-        return {"ok": True, "browser": browser}
+        return {"ok": True, "browser": browser, "playwright": pw}
     except Exception as e:
         return fail(ErrorCode.UNKNOWN, f"Browser launch failed: {e}")
 

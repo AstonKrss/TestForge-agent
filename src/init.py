@@ -284,9 +284,10 @@ class InitWizard:
         models = provider.get("models", [])
 
         if provider_id == "local":
-            print("  本地模型需要先安装 Ollama")
-            print("  模型列表由 Ollama 决定，这里使用默认 llama3")
-            return "llama3"
+            print("  本地模型需要先安装 Ollama，并提前 pull 好模型")
+            print("  常见模型名: llama3, qwen2.5, deepseek-r1, gemma3")
+            model = input("  请输入 Ollama 模型名称 [llama3]: ").strip()
+            return model or "llama3"
 
         print(f"  {provider['name']} 可用模型:")
 
@@ -338,7 +339,7 @@ class InitWizard:
             print("  请输入本地模型服务地址")
             print("  默认: http://localhost:11434 (Ollama)")
             api_key = input(f"  输入 URL [{api_url}]: ").strip()
-            return api_key or api_url
+            return (api_key or api_url).rstrip("/")
 
         print(f"  请输入 {provider['name']} 的 API Key")
         print(f"  获取地址: {api_url.replace('api.', 'console.')}")
@@ -477,12 +478,133 @@ class InitWizard:
         else:
             raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
 
+    async def _test_gemini(self, api_key: str, model: str) -> str:
+        """测试 Gemini 连接"""
+        import httpx
+
+        headers = {"content-type": "application/json"}
+        data = {
+            "contents": [{"parts": [{"text": "请回复'连接成功'四个字确认正常工作"}]}],
+            "generationConfig": {"maxOutputTokens": 50},
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                headers=headers, json=data,
+            )
+
+        if response.status_code == 200:
+            return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        elif response.status_code == 403:
+            raise Exception("API Key 无效或权限不足")
+        else:
+            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
+
+    async def _test_deepseek(self, api_key: str, model: str) -> str:
+        """测试 DeepSeek 连接"""
+        import httpx
+
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
+            "max_tokens": 50,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers=headers, json=data,
+            )
+
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        elif response.status_code == 401:
+            raise Exception("API Key 无效")
+        else:
+            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
+
+    async def _test_qwen(self, api_key: str, model: str) -> str:
+        """测试 Qwen 连接"""
+        import httpx
+
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        data = {
+            "model": model,
+            "input": {"messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}]},
+            "parameters": {"max_tokens": 50},
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                headers=headers, json=data,
+            )
+
+        if response.status_code == 200:
+            return response.json()["output"]["text"]
+        elif response.status_code == 401:
+            raise Exception("API Key 无效")
+        else:
+            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
+
+    async def _test_kimi(self, api_key: str, model: str) -> str:
+        """测试 Kimi 连接"""
+        import httpx
+
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
+            "max_tokens": 50,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.moonshot.cn/v1/chat/completions",
+                headers=headers, json=data,
+            )
+
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        elif response.status_code == 401:
+            raise Exception("API Key 无效")
+        else:
+            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
+
+    async def _test_minimax(self, api_key: str, model: str) -> str:
+        """测试 MiniMax 连接"""
+        import httpx
+
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
+            "max_output_tokens": 50,
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.minimax.chat/v1/text/chatcompletion_v2",
+                headers=headers, json=data,
+            )
+
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        elif response.status_code == 401:
+            raise Exception("API Key 无效")
+        else:
+            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
+
     async def _test_local(self, url: str) -> str:
         """测试本地模型连接"""
         import httpx
 
+        url = (url or "http://localhost:11434").rstrip("/")
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
+            response = await client.get(
                 f"{url}/api/tags",
             )
 
@@ -494,332 +616,7 @@ class InitWizard:
         else:
             raise Exception(f"连接失败: {response.status_code}")
 
-    async def _test_gemini(self, api_key: str, model: str) -> str:
-        """测试 Gemini 连接"""
-        import httpx
 
-        headers = {
-            "content-type": "application/json",
-        }
-
-        data = {
-            "contents": [{
-                "parts": [{"text": "请回复'连接成功'四个字确认正常工作"}]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": 50,
-            },
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-        elif response.status_code == 400:
-            raise Exception("请求格式错误")
-        elif response.status_code == 403:
-            raise Exception("API Key 无效或权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_deepseek(self, api_key: str, model: str) -> str:
-        """测试 DeepSeek 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
-            "max_tokens": 50,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_qwen(self, api_key: str, model: str) -> str:
-        """测试 Qwen 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "input": {
-                "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}]
-            },
-            "parameters": {
-                "max_tokens": 50,
-            },
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["output"]["text"]
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足或余额不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_kimi(self, api_key: str, model: str) -> str:
-        """测试 Kimi 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
-            "max_tokens": 50,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.moonshot.cn/v1/chat/completions",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_minimax(self, api_key: str, model: str) -> str:
-        """测试 MiniMax 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "请回复'连接成功'四个字确认正常工作"}],
-            "max_output_tokens": 50,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.minimax.chat/v1/text/chatcompletion_v2",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_gemini(self, api_key: str, model: str) -> bool:
-        """测试 Gemini 连接"""
-        import httpx
-
-        headers = {
-            "content-type": "application/json",
-        }
-
-        data = {
-            "contents": [{
-                "parts": [{"text": "Hi"}]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": 10,
-            },
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 400:
-            raise Exception("请求格式错误")
-        elif response.status_code == 403:
-            raise Exception("API Key 无效或权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_deepseek(self, api_key: str, model: str) -> bool:
-        """测试 DeepSeek 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 10,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_qwen(self, api_key: str, model: str) -> bool:
-        """测试 Qwen 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "input": {
-                "messages": [{"role": "user", "content": "Hi"}]
-            },
-            "parameters": {
-                "max_tokens": 10,
-            },
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足或余额不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_kimi(self, api_key: str, model: str) -> bool:
-        """测试 Kimi 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 10,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.moonshot.cn/v1/chat/completions",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
-
-    async def _test_minimax(self, api_key: str, model: str) -> bool:
-        """测试 MiniMax 连接"""
-        import httpx
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "content-type": "application/json",
-        }
-
-        data = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_output_tokens": 10,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.minimax.chat/v1/text/chatcompletion_v2",
-                headers=headers,
-                json=data,
-            )
-
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 401:
-            raise Exception("API Key 无效")
-        elif response.status_code == 403:
-            raise Exception("API Key 权限不足")
-        else:
-            raise Exception(f"错误 {response.status_code}: {response.text[:100]}")
 
     def step_save_config(self, config: Config) -> str:
         """步骤5: 保存配置"""

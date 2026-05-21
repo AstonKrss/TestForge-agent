@@ -124,7 +124,7 @@ class LocalClient(AIClient):
         """调用本地模型"""
         import httpx
 
-        base_url = self.config.base_url or "http://localhost:11434"
+        base_url = (self.config.base_url or self.config.api_key or "http://localhost:11434").rstrip("/")
         model = self.config.model or "llama3"
 
         data = {

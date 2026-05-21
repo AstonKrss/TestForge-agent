@@ -1,0 +1,54 @@
+"""
+Structured CLI plan tests.
+"""
+
+from src.cli.agent_plan import extract_json_payload, normalize_agent_plan
+
+
+def test_extracts_fenced_json_payload():
+    payload = extract_json_payload("""```json
+{"intent": "execute", "actions": [{"type": "click", "target_ref": "e1"}]}
+```""")
+
+    assert payload["intent"] == "execute"
+    assert payload["actions"][0]["target_ref"] == "e1"
+
+
+def test_normalizes_action_list_plan():
+    plan = normalize_agent_plan({
+        "intent": "execute",
+        "actions": [
+            {"type": "fill", "target_ref": "e2", "fill_value": "admin"},
+            {"type": "click", "target_ref": "e3"},
+        ],
+    })
+
+    assert plan.intent == "execute"
+    assert [action.type for action in plan.actions] == ["fill", "click"]
+    assert plan.actions[0].fill_value == "admin"
+
+
+def test_normalizes_legacy_single_step_plan():
+    plan = normalize_agent_plan({
+        "type": "fill",
+        "description": "搜索框",
+        "target_ref": "e10",
+        "fill_value": "天气",
+    })
+
+    assert plan.intent == "fill"
+    assert len(plan.actions) == 1
+    assert plan.actions[0].target_ref == "e10"
+    assert plan.actions[0].fill_value == "天气"
+
+
+def test_normalizes_replan_metadata():
+    plan = normalize_agent_plan({
+        "intent": "execute",
+        "needs_replan_after_navigation": True,
+        "post_navigation_task": "搜索 linux 并点赞文章",
+        "actions": [{"type": "navigate", "url": "http://example.com"}],
+    })
+
+    assert plan.needs_replan_after_navigation is True
+    assert plan.post_navigation_task == "搜索 linux 并点赞文章"
