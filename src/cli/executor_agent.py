@@ -163,6 +163,17 @@ class ExecutorAgent:
             return ExecutorResult(type=ResultType.SUCCESS, data=result.data)
         return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
 
+    async def performance_audit(self, runs: int = 1, reload: bool = False) -> ExecutorResult:
+        result = await tools.performance_audit(self.page, runs=runs, reload=reload)
+        if result.ok:
+            summary = result.data.get("summary", {})
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data=result.data,
+                summary=f"性能评分 {summary.get('score', 0)}/100 ({summary.get('rating', 'unknown')})",
+            )
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
     # ─── 登录结果判定 ────────────────────────────────────────────────────────
 
     def _snapshot_text(self, snapshot: ExecutorResult) -> str:

@@ -26,7 +26,9 @@ from .tools import (
     scroll,
     wait,
     screenshot,
+    performance_audit,
 )
+from .session_store import SessionStore
 
 __all__ = [
     # 入口
@@ -48,4 +50,6 @@ __all__ = [
     "scroll",
     "wait",
     "screenshot",
+    "performance_audit",
+    "SessionStore",
 ]

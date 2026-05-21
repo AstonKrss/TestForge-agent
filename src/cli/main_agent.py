@@ -21,6 +21,7 @@ MainAgent - 主对话 Agent
 import asyncio
 import re
 import getpass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
@@ -30,6 +31,7 @@ from ..ai_client import create_ai_client, AIClient
 from .executor_agent import ExecutorAgent, ExecutorResult, ResultType
 from .agent_plan import AgentAction, AgentPlan, extract_json_payload, normalize_agent_plan
 from .planning_agent import PlanningAgent
+from .session_store import SessionStore
 from .task_state import TaskState, extract_comment_text, extract_search_keyword
 from .verifier_agent import VerifierAgent
 
@@ -41,6 +43,12 @@ from .verifier_agent import VerifierAgent
 @dataclass
 class SessionContext:
     """会话上下文"""
+    # 会话元信息
+    session_name: str = "default"
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    updated_at: str = ""
+    events: List[Dict[str, Any]] = field(default_factory=list)
+
     # 页面状态
     current_url: str = ""
     current_title: str = ""
@@ -86,8 +94,68 @@ class SessionContext:
         if feature and feature not in self.discovered_features:
             self.discovered_features.append(feature)
 
+    def add_event(self, role: str, text: str, data: Optional[Dict[str, Any]] = None):
+        self.events.append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "role": role,
+            "text": text,
+            "data": data or {},
+        })
+        self.events = self.events[-200:]
+
+    def to_dict(self, redact: bool = True) -> Dict[str, Any]:
+        credentials = dict(self.credentials)
+        if redact and credentials.get("password"):
+            credentials["password"] = "***"
+        return {
+            "session_name": self.session_name,
+            "created_at": self.created_at,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "current_url": self.current_url,
+            "current_title": self.current_title,
+            "page_history": list(self.page_history),
+            "is_logged_in": self.is_logged_in,
+            "logged_in_user": self.logged_in_user,
+            "tested_features": list(self.tested_features),
+            "discovered_features": list(self.discovered_features),
+            "credentials": credentials,
+            "current_task_state": dict(self.current_task_state),
+            "last_failed_action": dict(self.last_failed_action),
+            "known_feature_map": dict(self.known_feature_map),
+            "known_selectors": dict(self.known_selectors),
+            "events": list(self.events),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionContext":
+        context = cls()
+        for key in (
+            "session_name",
+            "created_at",
+            "updated_at",
+            "current_url",
+            "current_title",
+            "page_history",
+            "is_logged_in",
+            "logged_in_user",
+            "tested_features",
+            "discovered_features",
+            "credentials",
+            "current_task_state",
+            "last_failed_action",
+            "known_feature_map",
+            "known_selectors",
+            "events",
+        ):
+            if key in data:
+                setattr(context, key, data[key])
+        if context.credentials.get("password") == "***":
+            context.credentials.pop("password", None)
+        return context
+
     def to_summary(self) -> str:
         lines = []
+        lines.append(f"会话: {self.session_name}")
         lines.append(f"当前页面: {self.current_url or '(未打开)'}")
         if self.is_logged_in:
             lines.append(f"登录状态: 已登录 {self.logged_in_user or ''}")
@@ -127,6 +195,7 @@ class MainAgent:
         self.executor = ExecutorAgent(page, self.ai_client)
         self.planning_agent = PlanningAgent(self.ai_client)
         self.verifier = VerifierAgent()
+        self.session_store = SessionStore()
         self.context = SessionContext()
         self._running = False
         self._last_action_requested_replan = False
@@ -171,6 +240,9 @@ class MainAgent:
                 print(f"  {self.context.to_summary()}")
                 continue
 
+            if await self._handle_session_command(user_input):
+                continue
+
             if cmd in ("screenshot", "截图"):
                 b64 = await self.executor.get_screenshot_base64()
                 if b64:
@@ -188,10 +260,86 @@ class MainAgent:
 
     # ─── 命令处理 ──────────────────────────────────────────────────────────────
 
+    async def _handle_session_command(self, user_input: str) -> bool:
+        """Handle local session/project commands before normal planning."""
+        text = user_input.strip()
+        lower = text.lower()
+
+        if lower in ("sessions", "session list", "list sessions", "会话列表", "列出会话"):
+            sessions = self.session_store.list()
+            if not sessions:
+                print("  暂无本地会话")
+                return True
+            print("\n[会话列表]")
+            for item in sessions[:20]:
+                features = ", ".join(item.get("tested_features") or [])
+                print(f"  - {item['name']} | {item.get('updated_at', '')} | {item.get('current_url', '')}")
+                if features:
+                    print(f"    已测: {features}")
+            return True
+
+        if self._starts_with_any(text, ["保存会话", "保存项目", "save session", "session save"]):
+            name = self._session_name_after_command(text) or self.context.session_name
+            path = self.session_store.save(name, self.context.to_dict(redact=True))
+            self.context.session_name = name
+            self.context.add_event("system", f"保存会话 {name}", {"path": str(path)})
+            print(f"  ✓ 会话已保存: {path}")
+            print("  提醒: 密码/token 不会明文保存，下次加载后如需登录会重新询问或使用新输入的凭证。")
+            return True
+
+        if self._starts_with_any(text, ["加载会话", "打开会话", "load session", "session load"]):
+            name = self._session_name_after_command(text)
+            if not name:
+                print("  请指定会话名，例如: 加载会话 blog-test")
+                return True
+            try:
+                data = self.session_store.load(name)
+            except FileNotFoundError as e:
+                print(f"  ✗ {e}")
+                return True
+            self.context = SessionContext.from_dict(data)
+            self.context.session_name = data.get("session_name") or name
+            self.context.add_event("system", f"加载会话 {self.context.session_name}")
+            print(f"  ✓ 已加载会话: {self.context.session_name}")
+            print(f"  {self.context.to_summary()}")
+            if self.context.current_url:
+                await self._handle_navigate(self.context.current_url)
+            return True
+
+        if self._starts_with_any(text, ["新建会话", "新开会话", "new session", "session new"]):
+            name = self._session_name_after_command(text) or datetime.now().strftime("session-%Y%m%d-%H%M%S")
+            self.context = SessionContext(session_name=name)
+            self._current_task_state = None
+            self._last_action_requested_replan = False
+            print(f"  ✓ 已新建会话: {name}")
+            return True
+
+        return False
+
+    def _starts_with_any(self, text: str, prefixes: List[str]) -> bool:
+        lower = text.lower().strip()
+        return any(lower.startswith(prefix.lower()) for prefix in prefixes)
+
+    def _session_name_after_command(self, text: str) -> str:
+        patterns = [
+            r"^(?:保存会话|保存项目|加载会话|打开会话|新建会话|新开会话)\s*[:：]?\s*(.+)$",
+            r"^(?:save session|session save|load session|session load|new session|session new)\s+(.+)$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text.strip(), re.IGNORECASE)
+            if match:
+                return match.group(1).strip().strip('"\'')
+        return ""
+
     async def _handle_user_input(self, user_input: str):
         """处理用户输入：统一交给 AI 分析意图"""
         print()
         print(f"[用户] {user_input}")
+        self.context.add_event("user", user_input)
+
+        if self._looks_like_performance_request(user_input):
+            await self._run_performance_audit(user_input)
+            return
 
         # 测试用例文件是本地路径，先确定性处理；其它自然语言交给主 Agent 规划。
         spec_path = self._extract_spec_path(user_input)
@@ -399,6 +547,8 @@ class MainAgent:
                 steps.append(DelegatedStep("ExplorerAgent", "分析当前页面可测试功能"))
             elif action.type.startswith("extract_"):
                 steps.append(DelegatedStep("ExplorerAgent", f"抽取页面结构: {action.type}"))
+            elif action.type == "performance_audit":
+                steps.append(DelegatedStep("PerformanceAgent", f"采集页面性能指标（{action.runs} 次）"))
             elif action.type == "test_login":
                 steps.extend(self._build_initial_request_plan("登录", "", {}))
             elif action.type == "ask_user":
@@ -623,6 +773,77 @@ class MainAgent:
                 url = match.group(0)
                 return self._prepare_url(url)
         return None
+
+    def _looks_like_performance_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        return any(term in lower for term in ["性能", "性能测试", "performance", "测速", "加载速度", "页面速度"])
+
+    async def _run_performance_audit(self, user_input: str):
+        """Run a deterministic performance audit tool."""
+        url = self._extract_url(user_input)
+        if url:
+            await self._handle_navigate(url)
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：性能测试 http://example.com")
+            return
+
+        runs = self._extract_performance_runs(user_input)
+        reload = any(term in user_input.lower() for term in ["reload", "刷新", "重新加载", "冷启动"])
+
+        print("\n[性能测试]")
+        print("  PerformanceAgent: 采集 Navigation Timing / Paint / Resource 指标")
+        result = await self.executor.performance_audit(runs=runs, reload=reload)
+        if result.type != ResultType.SUCCESS:
+            print(f"  ✗ 性能测试失败: {result.reason}")
+            return
+
+        self.context.add_tested_feature("性能测试")
+        self.context.add_event("agent", result.summary, {"tool": "performance_audit"})
+        self._print_performance_report(result.data)
+
+    def _extract_performance_runs(self, text: str) -> int:
+        match = re.search(r"(\d+)\s*(?:次|遍|轮|runs?)", text or "", re.IGNORECASE)
+        if not match:
+            return 1
+        return max(1, min(int(match.group(1)), 5))
+
+    def _print_performance_report(self, data: Dict[str, Any]):
+        summary = data.get("summary", {})
+        average = summary.get("average", {})
+        rating_map = {
+            "good": "良好",
+            "needs_attention": "需要关注",
+            "poor": "较差",
+        }
+        print(f"  评分: {summary.get('score', 0)}/100 ({rating_map.get(summary.get('rating'), summary.get('rating', 'unknown'))})")
+        print(f"  平均 TTFB: {average.get('ttfb', 0)} ms")
+        print(f"  DOMContentLoaded: {average.get('domContentLoaded', 0)} ms")
+        print(f"  Load: {average.get('load', 0)} ms")
+        fcp = summary.get("firstContentfulPaint") or 0
+        if fcp:
+            print(f"  FCP: {fcp} ms")
+        print(f"  资源请求: {summary.get('resourceCount', 0)} 个")
+        print(f"  传输体积: {self._format_bytes(summary.get('transferSize', 0))}")
+
+        slow = summary.get("slowResources") or []
+        if slow:
+            print("  慢资源 Top:")
+            for item in slow[:5]:
+                name = item.get("name", "")
+                short = name[-80:] if len(name) > 80 else name
+                print(f"    - {item.get('duration', 0)} ms | {item.get('initiatorType', 'other')} | {short}")
+
+        print("  建议:")
+        for recommendation in summary.get("recommendations", []):
+            print(f"    - {recommendation}")
+
+    def _format_bytes(self, value: Any) -> str:
+        size = float(value or 0)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+        return f"{size:.1f} GB"
 
     def _prepare_url(self, url: str) -> str:
         """Normalize a URL coming from either user text or model output."""
@@ -1277,6 +1498,13 @@ class MainAgent:
                 print("  页面提示需要登录")
             return result
 
+        if action_type == "performance_audit":
+            result = await self.executor.performance_audit(runs=action.runs, reload=action.reload)
+            if result.ok:
+                self.context.add_tested_feature("性能测试")
+                self._print_performance_report(result.data)
+            return result
+
         if action_type == "test_login":
             await self._handle_test_task("测试登录")
             return None
@@ -1530,6 +1758,10 @@ class MainAgent:
   http://xxx.com            - 访问网站
   测试登录 / 测试注册        - 测试对应功能
   运行 specs/login.md       - 导入并执行 Markdown 测试用例
+  性能测试 当前页面/URL       - 采集加载耗时、FCP、资源体积、慢资源
+  保存会话 blog-test         - 保存当前测试会话到本地
+  加载会话 blog-test         - 加载会话并恢复页面
+  会话列表 / 新建会话 name    - 管理本地测试项目/会话
   帮我看看这个页面           - AI 分析当前页面
   点击[按钮名]               - 点击按钮
   截图                      - 获取当前页面截图

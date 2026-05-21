@@ -669,6 +669,137 @@ async def extract_like_buttons(page) -> ToolResult:
         return _fail("EXTRACT_LIKE_FAILED", str(e))
 
 
+async def performance_audit(page, runs: int = 1, reload: bool = False) -> ToolResult:
+    """Collect browser-side performance metrics for the current page."""
+    if not getattr(page, "url", "") or page.url == "about:blank":
+        return _fail("NO_PAGE", "请先打开一个页面再进行性能测试")
+
+    runs = max(1, min(int(runs or 1), 5))
+    samples = []
+    for index in range(runs):
+        try:
+            if reload or index > 0:
+                await page.reload(wait_until="load", timeout=45000)
+            else:
+                try:
+                    await page.wait_for_load_state("load", timeout=8000)
+                except Exception:
+                    pass
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+            samples.append(await page.evaluate("""
+                () => {
+                    const nav = performance.getEntriesByType('navigation')[0] || {};
+                    const paints = {};
+                    for (const entry of performance.getEntriesByType('paint')) {
+                        paints[entry.name] = Math.round(entry.startTime || 0);
+                    }
+                    const resources = performance.getEntriesByType('resource')
+                        .map((entry) => ({
+                            name: entry.name,
+                            initiatorType: entry.initiatorType || 'other',
+                            duration: Math.round(entry.duration || 0),
+                            transferSize: Math.round(entry.transferSize || 0),
+                            encodedBodySize: Math.round(entry.encodedBodySize || 0),
+                        }));
+                    const byType = {};
+                    for (const item of resources) {
+                        const type = item.initiatorType || 'other';
+                        if (!byType[type]) byType[type] = { count: 0, transferSize: 0, encodedBodySize: 0 };
+                        byType[type].count += 1;
+                        byType[type].transferSize += item.transferSize || 0;
+                        byType[type].encodedBodySize += item.encodedBodySize || 0;
+                    }
+                    return {
+                        url: location.href,
+                        title: document.title || '',
+                        timing: {
+                            ttfb: Math.round((nav.responseStart || 0) - (nav.requestStart || 0)),
+                            domContentLoaded: Math.round(nav.domContentLoadedEventEnd || 0),
+                            load: Math.round(nav.loadEventEnd || nav.duration || 0),
+                            duration: Math.round(nav.duration || 0),
+                        },
+                        paints,
+                        resources: {
+                            total: resources.length,
+                            transferSize: resources.reduce((sum, item) => sum + (item.transferSize || 0), 0),
+                            encodedBodySize: resources.reduce((sum, item) => sum + (item.encodedBodySize || 0), 0),
+                            byType,
+                            slow: resources
+                                .filter((item) => item.duration >= 500)
+                                .sort((a, b) => b.duration - a.duration)
+                                .slice(0, 10),
+                        },
+                    };
+                }
+            """))
+        except Exception as e:
+            return _fail("PERFORMANCE_AUDIT_FAILED", str(e))
+
+    summary = _summarize_performance(samples)
+    return _ok({"samples": samples, "summary": summary, "runs": runs, "reload": reload})
+
+
+def _summarize_performance(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest = samples[-1] if samples else {}
+    timings = [sample.get("timing", {}) for sample in samples]
+
+    def avg(key: str) -> int:
+        values = [item.get(key, 0) for item in timings if item.get(key, 0)]
+        return round(sum(values) / len(values)) if values else 0
+
+    resources = latest.get("resources", {})
+    transfer_size = int(resources.get("transferSize") or 0)
+    resource_count = int(resources.get("total") or 0)
+    load_ms = avg("load") or avg("duration")
+    fcp = latest.get("paints", {}).get("first-contentful-paint", 0)
+
+    score = 100
+    recommendations = []
+    if load_ms > 4000:
+        score -= 30
+        recommendations.append("页面 load 超过 4s，建议拆分首屏资源、减少阻塞脚本并启用缓存")
+    elif load_ms > 2500:
+        score -= 15
+        recommendations.append("页面 load 超过 2.5s，可继续压缩资源并延迟非首屏脚本")
+    if fcp and fcp > 2500:
+        score -= 20
+        recommendations.append("FCP 超过 2.5s，首屏渲染偏慢，检查 CSS/字体/首屏接口")
+    if transfer_size > 3 * 1024 * 1024:
+        score -= 20
+        recommendations.append("传输体积超过 3MB，建议压缩图片、开启 gzip/br、移除未用资源")
+    elif transfer_size > 1024 * 1024:
+        score -= 10
+        recommendations.append("传输体积超过 1MB，建议关注图片和 JS 包大小")
+    if resource_count > 120:
+        score -= 10
+        recommendations.append("资源请求数量较多，建议合并或延迟加载低优先级资源")
+    if not recommendations:
+        recommendations.append("基础加载指标良好，可继续结合业务接口和并发压测验证")
+
+    score = max(0, min(100, score))
+    rating = "good" if score >= 85 else "needs_attention" if score >= 65 else "poor"
+    return {
+        "score": score,
+        "rating": rating,
+        "average": {
+            "ttfb": avg("ttfb"),
+            "domContentLoaded": avg("domContentLoaded"),
+            "load": load_ms,
+            "duration": avg("duration"),
+        },
+        "firstContentfulPaint": fcp,
+        "resourceCount": resource_count,
+        "transferSize": transfer_size,
+        "recommendations": recommendations,
+        "slowResources": resources.get("slow", []),
+        "byType": resources.get("byType", {}),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 工具注册表
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,6 +821,7 @@ TOOLS = {
     "extract_article_content": extract_article_content,
     "extract_auth_requirements": extract_auth_requirements,
     "extract_like_buttons": extract_like_buttons,
+    "performance_audit": performance_audit,
 }
 
 
@@ -724,4 +856,5 @@ __all__ = [
     "extract_article_content",
     "extract_auth_requirements",
     "extract_like_buttons",
+    "performance_audit",
 ]

@@ -52,3 +52,15 @@ def test_normalizes_replan_metadata():
 
     assert plan.needs_replan_after_navigation is True
     assert plan.post_navigation_task == "搜索 linux 并点赞文章"
+
+
+def test_normalizes_performance_audit_action():
+    plan = normalize_agent_plan({
+        "intent": "performance_audit",
+        "runs": 3,
+        "reload": True,
+    })
+
+    assert plan.actions[0].type == "performance_audit"
+    assert plan.actions[0].runs == 3
+    assert plan.actions[0].reload is True

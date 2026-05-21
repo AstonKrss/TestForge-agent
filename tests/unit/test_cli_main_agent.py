@@ -150,6 +150,23 @@ class TestMainAgentRequestHelpers:
 
         assert [step.agent for step in steps] == ["BrowserAgent", "BrowserAgent", "VerifierAgent"]
 
+    def test_build_plan_steps_for_performance_action(self):
+        agent = MainAgent.__new__(MainAgent)
+        plan = AgentPlan(
+            intent="execute",
+            actions=[AgentAction(type="performance_audit", runs=3)],
+        )
+
+        steps = agent._build_plan_steps(plan)
+
+        assert steps[0].agent == "PerformanceAgent"
+
+    def test_detects_performance_request_and_runs(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        assert agent._looks_like_performance_request("性能测试当前页面 3 次")
+        assert agent._extract_performance_runs("性能测试当前页面 3 次") == 3
+
     def test_extract_search_keyword(self):
         agent = MainAgent.__new__(MainAgent)
 

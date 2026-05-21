@@ -66,6 +66,7 @@ class PlanningAgent:
 可用下层能力:
 - BrowserAgent: navigate/click/fill/scroll/wait
 - ExplorerAgent: extract_links/extract_search_results/extract_forms/extract_article_content/extract_auth_requirements/extract_like_buttons
+- PerformanceAgent: performance_audit，用浏览器 Performance API 采集页面加载、资源体积、慢资源
 - AuthAgent: test_login/test_register，并可请求 username/password/captcha
 - VerifierAgent: 验证 URL 变化、文本出现、登录状态、搜索结果、点赞/评论是否完成
 
@@ -78,13 +79,15 @@ class PlanningAgent:
   "ask_fields": ["username", "password"],
   "actions": [
     {{
-      "type": "navigate|test_login|test_register|analyze|extract_search_results|extract_forms|extract_article_content|extract_auth_requirements|extract_like_buttons|click|fill|assert_text|assert_visible|scroll|wait|ask_user",
+      "type": "navigate|test_login|test_register|analyze|performance_audit|extract_search_results|extract_forms|extract_article_content|extract_auth_requirements|extract_like_buttons|click|fill|assert_text|assert_visible|scroll|wait|ask_user",
       "description": "动作说明",
       "url": "只在 navigate 时填写",
       "target_ref": "当前页面元素 ref，例如 e12。没有当前页面元素时留空",
       "target_desc": "元素描述，例如 搜索框/登录按钮/点赞按钮",
       "fill_value": "fill 动作的值",
       "expected": "验证文本",
+      "runs": 1,
+      "reload": false,
       "ask_fields": ["username", "password"]
     }}
   ]
@@ -105,6 +108,7 @@ class PlanningAgent:
 11. 点赞任务通常需要先进入文章详情，再点击点赞/like 按钮；如果当前只在搜索结果页，先打开最相关的文章，再继续规划点赞。
 12. 如果页面文字或元素出现“请登录/请先登录/登录后/点击登录”，并且用户任务是评论、点赞、发文章等受保护操作，必须先规划 test_login 或 click “点击登录”，不要直接 fill 评论框。
 13. 如果评论框提示“请登录后发表评论”，当前状态就是未登录；不要把页面上的“登录/欢迎/后台”等普通文本当成已登录。
+14. 如果用户要求性能测试、加载速度、performance、测速，规划 performance_audit；如果用户给了 URL 且未打开目标页，先 navigate，再 performance_audit。
 """
 
     def _format_elements(self, elements: List[Dict[str, Any]], limit: int = 40) -> str:

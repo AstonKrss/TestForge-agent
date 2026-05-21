@@ -28,6 +28,8 @@ class AgentAction:
     direction: str = "down"
     amount: int = 300
     seconds: float = 1.0
+    runs: int = 1
+    reload: bool = False
     ask_fields: List[str] = field(default_factory=list)
 
     @classmethod
@@ -65,6 +67,8 @@ class AgentAction:
             direction=_as_str(data.get("direction") or "down") or "down",
             amount=_as_int(data.get("amount"), 300),
             seconds=_as_float(data.get("seconds"), 1.0),
+            runs=_as_int(data.get("runs"), 1),
+            reload=_as_bool(data.get("reload"), False),
             ask_fields=[_as_str(field) for field in ask_fields if _as_str(field)],
         )
 
@@ -163,6 +167,7 @@ def normalize_agent_plan(raw: Dict[str, Any]) -> AgentPlan:
         "analyze",
         "test_login",
         "test_register",
+        "performance_audit",
     }:
         actions = [AgentAction.from_dict({**raw, "type": intent})]
 
@@ -206,6 +211,14 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "是", "需要", "reload"}
 
 
 __all__ = [
