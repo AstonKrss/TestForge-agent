@@ -797,6 +797,7 @@ LLM: 在密码输入框填入密码（需要用户提供）"""
                 selector = f"*:nth-of-type({idx})"  # 简单近似
 
                 # 实际用 JS 找到元素并 fill
+                safe_value = json.dumps(value)
                 filled = await self.page.evaluate(f"""
                     () => {{
                         const elems = document.querySelectorAll('input, textarea');
@@ -805,7 +806,7 @@ LLM: 在密码输入框填入密码（需要用户提供）"""
                             return rect.width > 0 && rect.height > 0;
                         }});
                         if (elems[{idx}]) {{
-                            elems[{idx}].value = '{value.replace("'", "\\'")}';
+                            elems[{idx}].value = {safe_value};
                             elems[{idx}].dispatchEvent(new Event('input', {{ bubbles: true }}));
                             return true;
                         }}

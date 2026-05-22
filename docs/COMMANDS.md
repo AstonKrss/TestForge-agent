@@ -18,6 +18,65 @@ Startup menu:
 0. 退出
 ```
 
+## Recommended Workflows
+
+### First Time Testing A Site
+
+```text
+帮我测试一下 http://example.com 这个网站
+现在页面有什么功能？可以测试什么？
+对 http://example.com 进行全部功能测试！全套包括功能测试、性能测试、压力测试、安全测试、无障碍测试，并生成报告
+生成报告 html
+保存会话 example-test
+```
+
+### Full Functional Coverage
+
+Use this when you want TestForge to test the site like a QA engineer, not only open links:
+
+```text
+对 http://example.com 进行全部功能测试
+把这个网站所有能发现的功能都测试一遍并生成报告
+全量测试 http://example.com
+```
+
+The full suite will run entry smoke checks plus deeper discovered-section checks for pages such as archive, tags, guestbook, friends, projects, tools, games, photos, resources, login, register, and RSS. Destructive or data-creating actions are stopped before submit unless you explicitly confirm them.
+
+### Login / Comment / Like Flow
+
+```text
+测试登录功能 账号是admin 密码是********
+测试搜索功能 搜索 linux，打开第一篇文章
+测试评论功能 评论一个666，如果需要登录就先登录
+测试点赞功能，如果点赞需要登录就使用账号密码登录
+```
+
+### Test Engineer Workbench
+
+```text
+测试计划
+生成测试用例
+用例列表
+运行用例 login-case
+生成缺陷
+运行Postman collection.json 环境 env.json
+配置MySQL host=127.0.0.1 port=3306 user=root password=xxx database=test
+执行SQL select * from users limit 10
+生成JMeter脚本 http://example.com 线程10 循环20 状态码200
+导出 Playwright 用例
+运行pytest 回归 tests/testforge
+```
+
+### Session And Regression
+
+```text
+保存会话 blog-test
+加载会话 blog-test
+会话列表
+回归测试 blog-test
+回归对比 blog-test
+```
+
 ## Open And Explore
 
 ```text
@@ -55,6 +114,8 @@ Full suite includes:
 - known feature smoke test
 - executable safe functional flows such as search, article reading, login verification, and comment prerequisites
 - deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, resources, RSS, register, and guestbook
+- nested feature checks inside section pages, for example tools -> practical resources / security tools / concrete tool pages
+- safe utility interaction probes for local transforms such as encode/decode/format/generate/hash
 - quality audit
 - security audit
 - accessibility audit

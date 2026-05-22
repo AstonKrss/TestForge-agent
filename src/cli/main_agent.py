@@ -25,7 +25,7 @@ import getpass
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
@@ -1668,6 +1668,7 @@ class MainAgent:
             return
 
         print("  DiscoveredFeatureAgent: 发现功能深度测试 - 逐个进入主要功能页并断言页面特征")
+        self._nested_feature_seen = set()
         for candidate in candidates:
             label = candidate.get("label", "")
             href = candidate.get("href", "")
@@ -1691,6 +1692,7 @@ class MainAgent:
             self._append_flow_result(results, feature, verdict["status"], verdict["reason"], verdict.get("data", {}))
             marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
             print(f"      {marker} {verdict['reason']}")
+            await self._run_nested_feature_checks(candidate, snapshot_data, results)
 
     def _deep_feature_candidates(self) -> List[Dict[str, str]]:
         site_map = self.context.site_map or {}
@@ -1726,16 +1728,17 @@ class MainAgent:
             "标签": 6,
             "友链": 7,
             "项目": 8,
-            "工具箱": 9,
-            "游戏": 10,
-            "相册": 11,
-            "旅行": 12,
-            "关于": 13,
-            "资源": 14,
-            "时间线": 15,
-            "碎碎念": 16,
-            "RSS": 17,
-            "终端/全屏": 18,
+            "安全工具": 9,
+            "工具箱": 10,
+            "游戏": 11,
+            "相册": 12,
+            "旅行": 13,
+            "关于": 14,
+            "资源": 15,
+            "时间线": 16,
+            "碎碎念": 17,
+            "RSS": 18,
+            "终端/全屏": 19,
         }
         selected.sort(key=lambda item: (priority.get(item["feature"], 99), item["href"]))
         return selected[:24]
@@ -1756,12 +1759,13 @@ class MainAgent:
             ("标签", ["标签", "tag", "/tags"]),
             ("友链", ["友链", "friends", "/friends"]),
             ("项目", ["项目", "project", "/projects"]),
+            ("资源", ["资源", "实用资源", "resource", "/resources"]),
+            ("安全工具", ["安全工具", "security tool", "security-tools", "/security"]),
             ("工具箱", ["工具箱", "工具", "tool", "/tools"]),
             ("游戏", ["游戏", "game", "/games"]),
             ("相册", ["相册", "photo", "/photos"]),
             ("旅行", ["旅行", "travel", "/travel"]),
             ("关于", ["关于", "about", "/about"]),
-            ("资源", ["资源", "resource", "/resources"]),
             ("时间线", ["时间线", "成长轨迹", "timeline", "/timeline"]),
             ("碎碎念", ["碎碎念", "notes", "/notes"]),
             ("RSS", ["rss", "/rss"]),
@@ -1780,6 +1784,137 @@ class MainAgent:
         except Exception:
             path = href.strip("/")
         return path or "首页"
+
+    async def _run_nested_feature_checks(
+        self,
+        parent: Dict[str, str],
+        snapshot: Dict[str, Any],
+        results: List[Dict[str, Any]],
+    ) -> None:
+        """Open second-level feature entries found inside a discovered feature page."""
+        nested = self._nested_feature_candidates(parent, snapshot)
+        if not nested:
+            return
+
+        print(f"      NestedFeatureAgent: 发现 {len(nested)} 个二级功能入口，继续验证")
+        parent_feature = parent.get("feature", "功能页")
+        for child in nested:
+            label = child.get("label", "")
+            href = child.get("href", "")
+            feature = child.get("feature", "二级功能")
+            print(f"        - {feature}: {label} -> {href}")
+            nav = await self.executor.navigate(href)
+            if not nav.ok:
+                self._append_flow_result(results, f"{parent_feature}/{feature}", "failed", nav.reason, {"href": href})
+                print(f"          ✗ 打开失败: {nav.reason}")
+                continue
+
+            child_snapshot = await self.executor.get_snapshot()
+            child_data = child_snapshot.data if child_snapshot.ok else {}
+            broken_reason = self._page_broken_reason(child_data)
+            if broken_reason:
+                self._append_flow_result(results, f"{parent_feature}/{feature}", "failed", broken_reason, {"href": href})
+                print(f"          ✗ 页面异常: {broken_reason}")
+                continue
+
+            verdict = await self._inspect_deep_feature_page(child, child_data)
+            self._append_flow_result(results, f"{parent_feature}/{feature}", verdict["status"], verdict["reason"], verdict.get("data", {}))
+            marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
+            print(f"          {marker} {verdict['reason']}")
+
+    def _nested_feature_candidates(self, parent: Dict[str, str], snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
+        parent_feature = parent.get("feature", "")
+        parent_href = parent.get("href", "")
+        parent_path = urlparse(parent_href).path.rstrip("/")
+        elements = snapshot.get("elements") or []
+        candidates: List[Dict[str, str]] = []
+        seen = getattr(self, "_nested_feature_seen", set())
+
+        deep_parent_features = {
+            "工具箱", "安全工具", "资源", "项目", "游戏", "相册", "旅行",
+            "归档", "标签", "友链", "终端/全屏",
+        }
+        if parent_feature not in deep_parent_features:
+            return []
+
+        for element in elements:
+            href = element.get("href") or ""
+            label = self._clean_nested_label(element)
+            if not href or not label:
+                continue
+            if href.startswith("#") or href.startswith(("javascript:", "mailto:", "tel:")):
+                continue
+            resolved = urljoin(parent_href, href)
+            if not self._same_origin(parent_href, resolved):
+                continue
+            parsed = urlparse(resolved)
+            if (parsed.path or "/") == "/":
+                continue
+            child_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            if not child_key or child_key == f"{urlparse(parent_href).scheme}://{urlparse(parent_href).netloc}{parent_path}":
+                continue
+            if child_key in seen:
+                continue
+            if self._is_unsafe_feature_href(label, resolved):
+                continue
+
+            feature = self._classify_deep_feature(label, resolved) or self._classify_nested_feature(parent_feature, label, resolved)
+            if not feature:
+                continue
+            if feature in {"搜索功能", "登录/认证", "博客列表", "留言/评论"} and parent_feature in deep_parent_features:
+                continue
+
+            seen.add(child_key)
+            candidates.append({"label": label[:80], "href": resolved, "feature": feature})
+
+        self._nested_feature_seen = seen
+        limit = 6 if parent_feature in {"工具箱", "安全工具", "资源", "项目", "游戏"} else 3
+        candidates.sort(key=lambda item: (self._nested_priority(item), item["href"]))
+        return candidates[:limit]
+
+    def _clean_nested_label(self, element: Dict[str, Any]) -> str:
+        raw = " ".join(str(element.get(key, "")) for key in ("text", "ariaLabel", "label", "title", "placeholder")).strip()
+        raw = re.sub(r"\s+", " ", raw)
+        if not raw:
+            raw = self._label_from_href(element.get("href", ""))
+        return raw[:120]
+
+    def _same_origin(self, left: str, right: str) -> bool:
+        try:
+            a = urlparse(left)
+            b = urlparse(right)
+            return bool(a.netloc and b.netloc and a.netloc == b.netloc and a.scheme == b.scheme)
+        except Exception:
+            return False
+
+    def _classify_nested_feature(self, parent_feature: str, label: str, href: str) -> str:
+        path = urlparse(href).path.lower()
+        blob = f"{label} {path}".lower()
+        if any(term in blob for term in ["安全", "security", "xss", "sql", "jwt", "hash", "加密", "解密", "编码", "解码"]):
+            return "安全工具"
+        if parent_feature == "工具箱" or "/tools/" in path:
+            return "工具子功能"
+        if parent_feature == "资源" or "/resources/" in path:
+            return "资源子功能"
+        if parent_feature == "项目" or "/projects/" in path:
+            return "项目子功能"
+        if parent_feature == "游戏" or "/games/" in path:
+            return "游戏子功能"
+        if parent_feature in {"相册", "旅行", "友链", "标签", "归档"}:
+            return f"{parent_feature}子功能"
+        return ""
+
+    def _nested_priority(self, item: Dict[str, str]) -> int:
+        feature = item.get("feature", "")
+        label = item.get("label", "")
+        blob = f"{feature} {label}".lower()
+        if any(term in blob for term in ["安全", "security", "xss", "sql", "jwt"]):
+            return 0
+        if any(term in blob for term in ["资源", "resource"]):
+            return 1
+        if "工具" in blob or "tool" in blob:
+            return 2
+        return 9
 
     async def _inspect_deep_feature_page(self, candidate: Dict[str, str], snapshot: Dict[str, Any]) -> Dict[str, Any]:
         feature = candidate.get("feature", "")
@@ -1856,6 +1991,33 @@ class MainAgent:
                 return {"status": "passed", "reason": f"友链页可访问，发现 {len(external_links)} 个外部链接", "data": data}
             return {"status": "blocked", "reason": "友链页可访问，但未发现外部链接", "data": data}
 
+        if feature in {
+            "安全工具", "工具子功能", "资源子功能", "项目子功能", "游戏子功能",
+            "相册子功能", "旅行子功能", "友链子功能", "标签子功能", "归档子功能",
+        }:
+            enabled_inputs = [item for item in inputs if not item.get("disabled")]
+            enabled_buttons = [item for item in buttons if not item.get("disabled")]
+            data["enabled_input_count"] = len(enabled_inputs)
+            data["enabled_button_count"] = len(enabled_buttons)
+            if feature in {"安全工具", "工具子功能"}:
+                probe = await self._safe_tool_interaction_probe(enabled_inputs, enabled_buttons)
+                if probe:
+                    data.update(probe.get("data", {}))
+                    return {
+                        "status": probe["status"],
+                        "reason": probe["reason"],
+                        "data": data,
+                    }
+            if enabled_inputs or enabled_buttons:
+                return {
+                    "status": "passed",
+                    "reason": f"{feature}可访问，发现 {len(enabled_inputs)} 个可用输入框 / {len(enabled_buttons)} 个可用按钮；未提交高风险动作",
+                    "data": data,
+                }
+            if len(text.strip()) >= 40 or links:
+                return {"status": "passed", "reason": f"{feature}可访问，页面内容/链接非空", "data": data}
+            return {"status": "failed", "reason": f"{feature}页面内容过少，疑似空页面", "data": data}
+
         if feature in {"项目", "工具箱", "游戏", "相册", "旅行", "关于", "资源", "时间线", "碎碎念", "终端/全屏", "RSS"}:
             if len(text.strip()) >= 40 or links or buttons:
                 return {
@@ -1868,6 +2030,60 @@ class MainAgent:
         if len(text.strip()) >= 40:
             return {"status": "passed", "reason": f"{feature}可访问，页面内容非空", "data": data}
         return {"status": "failed", "reason": f"{feature}页面内容过少", "data": data}
+
+    async def _safe_tool_interaction_probe(self, inputs: List[Dict[str, Any]], buttons: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Try a non-destructive interaction on local utility pages."""
+        if not inputs or not buttons:
+            return None
+        button = next((item for item in buttons if self._is_safe_tool_button(item)), None)
+        if not button:
+            return None
+
+        target_input = inputs[0]
+        fill = await self.executor.fill(ref=target_input.get("ref", ""), description="工具输入框", text="test")
+        if not fill.ok:
+            return {
+                "status": "blocked",
+                "reason": f"工具页控件存在，但安全测试值填写失败: {fill.reason}",
+                "data": {"tool_probe": "fill_failed"},
+            }
+
+        click = await self.executor.click(ref=button.get("ref", ""), description=button.get("text") or "工具按钮")
+        if not click.ok:
+            return {
+                "status": "blocked",
+                "reason": f"工具页输入框可填写，但安全按钮点击失败: {click.reason}",
+                "data": {"tool_probe": "click_failed"},
+            }
+
+        await self.executor.wait(0.4)
+        snapshot = await self.executor.get_snapshot()
+        text_length = len(snapshot.data.get("text", "")) if snapshot.ok else 0
+        return {
+            "status": "passed",
+            "reason": "工具页可交互：已填入安全测试值 test 并触发安全本地按钮",
+            "data": {
+                "tool_probe": "clicked_safe_button",
+                "button_text": button.get("text", ""),
+                "post_action_text_length": text_length,
+            },
+        }
+
+    def _is_safe_tool_button(self, button: Dict[str, Any]) -> bool:
+        blob = " ".join(str(button.get(key, "")) for key in ("text", "ariaLabel", "label", "title", "id", "name")).lower()
+        unsafe_terms = [
+            "扫描", "检测站点", "请求", "发送", "提交", "爆破", "攻击", "删除",
+            "上传", "发布", "支付", "scan", "request", "send", "submit",
+            "attack", "brute", "delete", "upload", "publish", "pay",
+        ]
+        if any(term in blob for term in unsafe_terms):
+            return False
+        safe_terms = [
+            "编码", "解码", "转换", "生成", "计算", "解析", "格式化", "复制",
+            "加密", "解密", "hash", "base64", "url", "json", "format",
+            "convert", "encode", "decode", "generate", "calculate", "parse",
+        ]
+        return any(term in blob for term in safe_terms)
 
     def _append_flow_result(
         self,
@@ -4351,44 +4567,64 @@ jobs:
 
     def _show_help(self):
         print("""
-命令:
-  http://xxx.com            - 访问网站
-  测试登录 / 测试注册        - 测试对应功能
-  运行 specs/login.md       - 导入并执行 Markdown 测试用例
-  性能测试 当前页面/URL       - 采集加载耗时、FCP、资源体积、慢资源
-  压力测试 URL 20次 并发2    - 受控 HTTP 压测，输出 RPS/P95/错误率
-  页面质量检查 当前页面/URL    - 检查无障碍、基础 SEO、链接/表单安全
-  测试计划 / 站点地图          - 生成测试矩阵或当前页面功能图
-  测试当前页面所有已知功能      - 安全冒烟测试页面已发现入口
-  探索站点 URL 深度2 页面20     - 带 URL Scope 的深度探索并保存 graph/elements/transcript
-  全量测试 URL                - 一键运行安全全套测试并生成报告
-  网络日志 / API测试           - 查看接口、慢请求、失败请求
-  安全检查 / 无障碍检查        - 安全响应头、混合内容、a11y 基础检查
-  保存基线 name / 视觉对比 name - 视觉回归基线和对比
-  测试数据 用户/评论/文章      - 生成并记录测试数据
-  生成测试用例 / 导出测试用例   - 把测试计划保存为 JSON/Markdown/CSV/XLSX
-  用例列表 / 运行用例 login-case - 查看并执行本地沉淀用例
-  根据需求文档 docs/a.md 生成测试用例 - 从需求文档生成用例
-  生成缺陷 / 提Bug             - 根据最近失败和证据生成缺陷单
-  运行Postman collection.json 环境 env.json - 执行 Postman Collection 并替换变量
-  配置MySQL host=... / 执行SQL select ... - SQL 模板和可选数据库校验
-  运行pytest 回归 tests/testforge - 执行导出的 pytest/Playwright 回归
-  生成JMeter脚本 URL 线程10 循环20 状态码200 - 导出带断言的 JMX
-  环境检查 / docker检查 / k8s检查 / docker日志 web - 检查环境和最近日志
-  回归对比 blog-test           - 对比失败、页面、功能和性能差异
-  生成报告 html/json/junit/all - 导出会话测试报告
-  导出 Playwright 用例         - 将交互动作 IR 导出成 Playwright Python 测试骨架
-  回归测试 blog-test           - 加载历史会话并重跑用户任务
-  生成CI配置 / Agent分工       - 生成 GitHub Actions 模板或查看角色
-  保存会话 blog-test         - 保存当前测试会话到本地
-  加载会话 blog-test         - 加载会话并恢复页面
-  会话列表 / 新建会话 name    - 管理本地测试项目/会话
-  帮我看看这个页面           - AI 分析当前页面
-  点击[按钮名]               - 点击按钮
-  截图                      - 获取当前页面截图
-  状态                      - 查看当前状态
-  help                     - 显示此帮助
-  q                        - 退出
+TestForge CLI 使用指南
+
+新手三步:
+  1. 打开网站:
+     帮我测试一下 http://example.com 这个网站
+  2. 看功能:
+     现在页面有什么功能？可以测试什么？
+  3. 全量测试并生成报告:
+     对 http://example.com 进行全部功能测试！全套包括功能测试、性能测试、压力测试、安全测试、无障碍测试，并生成报告
+
+常用功能测试:
+  测试登录功能 账号是admin 密码是********
+  测试搜索功能 搜索 linux，打开第一篇文章
+  测试评论功能 评论一个666，如果需要登录就先登录
+  测试点赞功能，如果点赞需要登录就使用账号密码登录
+  测试当前页面所有已知功能
+
+  全量测试会做:
+  测试计划、站点地图、入口冒烟、发现功能深度检查、二级功能入口检查、安全本地工具交互探针、搜索/文章/登录/评论前置流、
+  页面质量、安全、无障碍、性能、低压压测、网络/API摘要、HTML/JSON报告。
+  默认不会自动提交注册、评论、发文章、删除、支付等会产生真实数据或风险的动作。
+
+测试工程师工具:
+  测试计划                         - 生成测试矩阵
+  生成测试用例                     - 导出 JSON/Markdown/CSV/XLSX
+  用例列表 / 运行用例 login-case   - 管理并执行沉淀用例
+  根据需求文档 docs/a.md 生成测试用例
+  生成缺陷 / 提Bug                 - 根据失败、截图、网络日志生成缺陷单
+  运行Postman collection.json 环境 env.json
+  配置MySQL host=... / 执行SQL select ...
+  生成JMeter脚本 URL 线程10 循环20 状态码200
+  导出 Playwright 用例 / 运行pytest 回归 tests/testforge
+
+审计与定位:
+  页面质量检查 当前页面/URL
+  安全检查 当前页面/URL
+  无障碍检查 当前页面/URL
+  性能测试 当前页面/URL 3次
+  压力测试 URL 50次 并发5
+  网络日志 / API测试
+  截图 / locator / Agent分工
+
+会话与回归:
+  保存会话 blog-test
+  加载会话 blog-test
+  会话列表 / 新建会话 name
+  回归测试 blog-test
+  回归对比 blog-test
+  生成报告 html/json/junit/all
+
+其他:
+  运行 specs/login.md              - 导入并执行 Markdown 测试用例
+  探索站点 URL 深度2 页面20        - 深度探索并保存 graph/elements/transcript
+  保存基线 homepage / 视觉对比 homepage
+  测试数据 用户/评论/文章
+  status                           - 查看当前状态
+  help                             - 显示此帮助
+  q                                - 退出
 """)
 
     def _show_summary(self):

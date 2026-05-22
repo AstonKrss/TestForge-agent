@@ -275,6 +275,8 @@ def test_deep_feature_classifier_covers_site_sections():
 
     assert agent._classify_deep_feature("归档", "http://example.com/archive") == "归档"
     assert agent._classify_deep_feature("工具箱", "http://example.com/tools") == "工具箱"
+    assert agent._classify_deep_feature("推荐资源 学习平台 AI工具", "http://example.com/resources") == "资源"
+    assert agent._classify_deep_feature("安全工具箱", "http://example.com/tools/security") == "安全工具"
     assert agent._classify_deep_feature("趣味游戏", "http://example.com/games") == "游戏"
     assert agent._classify_deep_feature("立即注册", "http://example.com/register") == "注册入口"
     assert agent._classify_deep_feature("文章标题", "http://example.com/blog/post-1") == ""
@@ -295,3 +297,34 @@ def test_deep_feature_candidates_use_sitemap_major_sections():
     candidates = agent._deep_feature_candidates()
 
     assert [item["feature"] for item in candidates] == ["归档", "工具箱"]
+
+
+def test_nested_feature_candidates_find_tools_children():
+    agent = MainAgent.__new__(MainAgent)
+    agent._nested_feature_seen = set()
+    parent = {"feature": "工具箱", "href": "http://example.com/tools", "label": "工具箱"}
+    snapshot = {
+        "elements": [
+            {"text": "首页", "href": "http://example.com/"},
+            {"text": "实用资源", "href": "http://example.com/resources"},
+            {"text": "安全工具箱", "href": "http://example.com/tools/security"},
+            {"text": "删除", "href": "http://example.com/tools/delete"},
+            {"text": "外部站点", "href": "https://other.example.com/tool"},
+        ]
+    }
+
+    candidates = agent._nested_feature_candidates(parent, snapshot)
+
+    assert [(item["feature"], item["href"]) for item in candidates] == [
+        ("安全工具", "http://example.com/tools/security"),
+        ("资源", "http://example.com/resources"),
+    ]
+
+
+def test_safe_tool_button_filter_allows_local_transform_only():
+    agent = MainAgent.__new__(MainAgent)
+
+    assert agent._is_safe_tool_button({"text": "Base64 编码"})
+    assert agent._is_safe_tool_button({"text": "JSON 格式化"})
+    assert not agent._is_safe_tool_button({"text": "开始扫描"})
+    assert not agent._is_safe_tool_button({"text": "提交"})

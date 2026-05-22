@@ -6,7 +6,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue">
   <img alt="Playwright" src="https://img.shields.io/badge/Browser-Playwright-45ba63">
   <img alt="AI Agents" src="https://img.shields.io/badge/AI-Multi--Agent-purple">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-171%20passed-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-173%20passed-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
 </p>
 
@@ -91,6 +91,60 @@ python run_cli.py
 (TestForge) > 完整测试 对http://47.242.21.40/这个网站完整测试产出报告
 ```
 
+## CLI 使用教程
+
+进入 CLI 后，不需要先学习脚本语法，直接用自然语言描述测试目标即可。
+
+### 推荐新手流程
+
+```text
+1. 先打开网站
+(TestForge) > 帮我测试一下 http://example.com 这个网站
+
+2. 看页面有什么功能
+(TestForge) > 现在页面有什么功能？可以测试什么？
+
+3. 跑全量测试并生成报告
+(TestForge) > 对 http://example.com 进行全部功能测试，全套包括功能测试、性能测试、压力测试、安全测试、无障碍测试，并生成报告
+
+4. 如果要测登录、评论、点赞等需要账号的功能
+(TestForge) > 登录功能测试 账号是admin 密码是********
+(TestForge) > 测试评论功能，评论一个666，如果需要登录就先登录
+
+5. 保存本次项目会话，后续可回归
+(TestForge) > 保存会话 blog-test
+```
+
+### 一句话全量测试
+
+适合第一次接触一个网站时使用：
+
+```text
+对 http://example.com 进行全部功能测试！全套包括压力测试、性能测试、功能测试、安全测试、无障碍测试，并产出报告
+```
+
+TestForge 会执行：
+
+- 生成测试计划矩阵
+- 生成站点地图
+- 打开并检查已发现入口
+- 深度检查归档、标签、留言、友链、项目、工具箱、游戏、相册、资源、注册、登录等功能页
+- 对搜索、文章阅读、登录、评论前置条件等安全流程做真实操作
+- 执行质量、安全、无障碍、性能、低压压测和网络/API 摘要
+- 输出 HTML / JSON 报告
+
+### 常用调试命令
+
+```text
+help                     查看 CLI 帮助
+status                   查看当前页面、会话、已测试功能
+截图                     保存当前页面截图
+网络日志                 查看接口和慢请求
+生成报告 html            导出 HTML 报告
+保存会话 blog-test       保存当前上下文
+加载会话 blog-test       恢复历史上下文
+```
+
 ## Example Commands
 
 ### Exploratory Testing
@@ -126,6 +180,8 @@ The full suite runs:
 - known feature smoke testing
 - executable functional flows for safe paths such as search, article reading, login verification, and comment prerequisites
 - deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, travel, resources, RSS, terminal, register, and guestbook
+- nested feature checks inside section pages, for example tools -> practical resources / security tools / concrete tool pages
+- safe utility interaction probes for local transforms such as encode/decode/format/generate/hash
 - page quality audit
 - basic security audit
 - accessibility audit
@@ -345,7 +401,7 @@ python -m pytest tests/unit/ -q
 Current baseline:
 
 ```text
-171 passed
+173 passed
 ```
 
 ## Roadmap
