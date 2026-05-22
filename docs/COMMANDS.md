@@ -76,6 +76,23 @@ This is intentionally safer and narrower than the full suite: it opens discovere
 
 ```text
 测试计划
+生成测试用例
+用例列表
+运行用例 login-case
+根据需求文档 docs/login.md 生成测试用例
+生成缺陷
+运行Postman collection.json 环境 env.json
+配置MySQL host=127.0.0.1 port=3306 user=root password=xxx database=test
+执行SQL select * from users limit 10
+导出 Playwright 用例
+运行pytest 回归 tests/testforge
+生成JMeter脚本 http://example.com 线程10 循环20 状态码200
+环境检查
+docker检查
+k8s检查
+docker日志 web
+k8s日志 pod-name
+回归对比 blog-test
 站点地图
 探索站点 http://example.com 深度2 页面20
 探索站点 http://example.com 聚焦 include:/blog* exclude:/admin*
@@ -92,6 +109,21 @@ API测试
 生成报告 junit
 生成报告 all
 ```
+
+## QA Workbench
+
+These commands turn TestForge into a broader testing engineer workbench:
+
+- `生成测试用例`: converts the current test plan into JSON, Markdown, CSV, and XLSX files under `~/.testforge/cases`.
+- `用例列表` / `运行用例 login-case`: lists saved cases and replays their natural-language steps through the agent planner.
+- `根据需求文档 docs/a.md 生成测试用例`: parses Markdown/TXT requirements into test cases.
+- `生成缺陷`: creates a local defect ticket from the latest failure, artifacts, and network summary.
+- `运行Postman collection.json 环境 env.json`: executes a dependency-free subset of Postman Collection v2 format with `{{variables}}` substitution and saves an API report.
+- `执行SQL select ...`: builds or optionally executes SQL checks. Real execution requires `~/.testforge/mysql.json` or `配置MySQL ...`.
+- `导出 Playwright 用例` / `运行pytest 回归`: turns interaction IR into pytest-compatible Playwright skeletons and runs pytest.
+- `生成JMeter脚本 URL 线程10 循环20 状态码200`: exports a `.jmx` file with thread group, HTTP sampler, response-code assertion, optional CSV data set, and summary listener.
+- `环境检查` / `docker日志 web` / `k8s日志 pod`: runs safe read-only Linux/Docker/K8S/Git inspection or tail logs.
+- `回归对比 session-name`: compares current session results with a saved session, including failures, tested features, pages, and performance metric deltas.
 
 ## Plan Explore
 

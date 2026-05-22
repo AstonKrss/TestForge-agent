@@ -6,7 +6,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue">
   <img alt="Playwright" src="https://img.shields.io/badge/Browser-Playwright-45ba63">
   <img alt="AI Agents" src="https://img.shields.io/badge/AI-Multi--Agent-purple">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-158%20passed-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-167%20passed-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
 </p>
 
@@ -145,6 +145,19 @@ This runs the lighter `FeatureTestAgent` path: it uses the current page, sitemap
 
 ```text
 测试计划
+生成测试用例
+用例列表
+运行用例 login-case
+根据需求文档 docs/login.md 生成测试用例
+生成缺陷
+运行Postman collection.json 环境 env.json
+执行SQL select * from users limit 10
+导出 Playwright 用例
+运行pytest 回归 tests/testforge
+生成JMeter脚本 http://example.com 线程10 循环20 状态码200
+环境检查 / docker检查 / k8s检查
+docker日志 web / k8s日志 pod-name
+回归对比 blog-test
 站点地图
 探索站点 http://example.com 深度2 页面20
 探索站点 http://example.com 聚焦 include:/blog* exclude:/admin*
@@ -161,6 +174,19 @@ This runs the lighter `FeatureTestAgent` path: it uses the current page, sitemap
 加载会话 blog-test
 回归测试 blog-test
 ```
+
+### QA Workbench
+
+TestForge now includes practical tools that map to common testing engineer work:
+
+- Test case management: generate JSON/Markdown/CSV/XLSX cases, list saved case sets, and replay a named case through the agent.
+- Defect drafting: create local bug tickets with steps, actual/expected result, artifacts, API errors, console evidence placeholders, and a copyable summary.
+- API testing: import and run a Postman Collection subset, including environment/collection variable substitution, and save an API report.
+- Database validation: generate SQL templates and optionally execute MySQL checks after local config.
+- Pytest regression: export Playwright-style pytest skeletons from recorded IR and run pytest from the CLI.
+- Performance handoff: export JMeter `.jmx` scripts with a response-code assertion, optional CSV data set, and summary listener.
+- Environment inspection: run safe Linux/Docker/K8S/Git read-only checks and tail Docker/K8S logs.
+- Regression comparison: compare the current session against a saved session, including failures, tested features, visited pages, and performance deltas.
 
 See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command guide.
 
@@ -316,7 +342,7 @@ python -m pytest tests/unit/ -q
 Current baseline:
 
 ```text
-158 passed
+167 passed
 ```
 
 ## Roadmap

@@ -19,8 +19,10 @@ MainAgent - 主对话 Agent
 """
 
 import asyncio
+import json
 import re
 import getpass
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -42,6 +44,15 @@ from .engineering_tools import (
     build_site_map,
     explore_site_map,
     write_exploration_artifacts,
+)
+from .qa_workbench import (
+    DefectManager,
+    EnvironmentInspector,
+    JMeterExporter,
+    PostmanCollectionRunner,
+    RegressionComparer,
+    SQLWorkbench,
+    TestCaseManager,
 )
 from ..ir.writer import IRWriter
 from .planning_agent import PlanningAgent
@@ -93,6 +104,13 @@ class SessionContext:
     reports: List[str] = field(default_factory=list)
     site_map: Dict[str, Any] = field(default_factory=dict)
     visual_results: List[Dict[str, Any]] = field(default_factory=list)
+    test_cases: List[Dict[str, Any]] = field(default_factory=list)
+    defects: List[Dict[str, Any]] = field(default_factory=list)
+    api_runs: List[Dict[str, Any]] = field(default_factory=list)
+    sql_checks: List[Dict[str, Any]] = field(default_factory=list)
+    jmeter_plans: List[Dict[str, Any]] = field(default_factory=list)
+    environment_checks: List[Dict[str, Any]] = field(default_factory=list)
+    regression_results: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_page(self, url: str, title: str = ""):
         self.current_url = url
@@ -151,6 +169,13 @@ class SessionContext:
             "reports": list(self.reports),
             "site_map": dict(self.site_map),
             "visual_results": list(self.visual_results),
+            "test_cases": list(self.test_cases),
+            "defects": list(self.defects),
+            "api_runs": list(self.api_runs),
+            "sql_checks": list(self.sql_checks),
+            "jmeter_plans": list(self.jmeter_plans),
+            "environment_checks": list(self.environment_checks),
+            "regression_results": list(self.regression_results),
             "events": list(self.events),
         }
 
@@ -180,6 +205,13 @@ class SessionContext:
             "reports",
             "site_map",
             "visual_results",
+            "test_cases",
+            "defects",
+            "api_runs",
+            "sql_checks",
+            "jmeter_plans",
+            "environment_checks",
+            "regression_results",
             "events",
         ):
             if key in data:
@@ -238,6 +270,13 @@ class MainAgent:
         self.data_manager = TestDataManager()
         self.visual = VisualRegression()
         self.locator_memory = LocatorMemory()
+        self.case_manager = TestCaseManager()
+        self.defect_manager = DefectManager()
+        self.postman_runner = PostmanCollectionRunner()
+        self.sql_workbench = SQLWorkbench()
+        self.jmeter_exporter = JMeterExporter()
+        self.environment_inspector = EnvironmentInspector()
+        self.regression_comparer = RegressionComparer()
         self.context = SessionContext()
         self.ir_writer = IRWriter(str(Path.cwd()), self.context.run_id)
         self._running = False
@@ -438,6 +477,72 @@ class MainAgent:
                 return match.group(1).strip().strip('"\'')
         return ""
 
+    def _name_after_keyword(self, text: str, keywords: List[str]) -> str:
+        for keyword in keywords:
+            index = text.lower().find(keyword.lower())
+            if index >= 0:
+                value = text[index + len(keyword):].strip().strip('"\'')
+                value = re.sub(r"^(为|叫|命名为|name)\s*", "", value, flags=re.I).strip()
+                if value and not self._extract_url(value):
+                    return value[:80]
+        return ""
+
+    def _extract_any_file_path(self, text: str, suffixes: List[str]) -> Optional[str]:
+        suffix_pattern = "|".join(re.escape(suffix.lstrip(".")) for suffix in suffixes)
+        candidates = re.findall(
+            rf'(?:"([^"]+\.({suffix_pattern}))"|\'([^\']+\.({suffix_pattern}))\'|(\S+\.({suffix_pattern})))',
+            text,
+            re.IGNORECASE,
+        )
+        for groups in candidates:
+            raw = ""
+            for group in groups:
+                if group and Path(group).suffix.lower() in suffixes:
+                    raw = group
+                    break
+            if not raw:
+                continue
+            path = Path(raw)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if path.exists() and path.is_file():
+                return str(path)
+        return None
+
+    def _extract_env_file_path(self, text: str) -> Optional[str]:
+        match = re.search(r"(?:环境|env|environment)\s*[:：]?\s*([^\s]+\.json)", text, re.I)
+        if not match:
+            return None
+        path = Path(match.group(1).strip().strip('"\''))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return str(path) if path.exists() and path.is_file() else None
+
+    def _extract_severity(self, text: str) -> str:
+        match = re.search(r"(?:severity|严重级别|优先级|级别)\s*[:：]?\s*(P[0-4]|S[0-4]|blocker|critical|major|minor)", text, re.I)
+        if match:
+            return match.group(1).upper()
+        if any(term in text for term in ["严重", "阻塞", "崩溃", "critical", "blocker"]):
+            return "P1"
+        if any(term in text for term in ["轻微", "minor"]):
+            return "P3"
+        return "P2"
+
+    def _parse_key_values(self, text: str, keys: List[str]) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for key in keys:
+            match = re.search(rf"{re.escape(key)}\s*=\s*([^\s]+)", text, re.I)
+            if match:
+                result[key] = match.group(1).strip().strip('"\'')
+        return result
+
+    def _extract_number_after(self, text: str, keys: List[str], default: int = 1) -> int:
+        for key in keys:
+            match = re.search(rf"{re.escape(key)}\s*[:：]?\s*(\d+)", text, re.I)
+            if match:
+                return max(1, int(match.group(1)))
+        return default
+
     async def _handle_engineering_command(self, user_input: str) -> bool:
         """Handle testing-engineering commands that do not need model planning."""
         text = user_input.strip()
@@ -453,6 +558,54 @@ class MainAgent:
 
         if any(term in lower for term in ["测试计划", "测试矩阵", "生成计划", "test plan"]):
             await self._generate_and_show_test_plan()
+            return True
+
+        if any(term in lower for term in ["运行用例", "执行用例", "run case"]):
+            await self._run_managed_test_case(text)
+            return True
+
+        if any(term in lower for term in ["用例列表", "查看用例", "case list"]):
+            self._list_managed_test_cases()
+            return True
+
+        if any(term in lower for term in ["生成测试用例", "保存测试用例", "导出测试用例", "用例中心", "test case", "testcase"]):
+            await self._generate_test_cases(text)
+            return True
+
+        if any(term in lower for term in ["需求文档", "根据需求", "导入需求", "requirement"]):
+            await self._generate_cases_from_requirement(text)
+            return True
+
+        if any(term in lower for term in ["生成缺陷", "创建缺陷", "提bug", "提 bug", "bug单", "defect"]):
+            self._create_defect_ticket(text)
+            return True
+
+        if any(term in lower for term in ["运行pytest", "pytest回归", "pytest 回归", "run pytest"]):
+            self._run_pytest_regression(text)
+            return True
+
+        if any(term in lower for term in ["导入postman", "运行postman", "postman collection", "postman"]):
+            self._run_postman_collection(text)
+            return True
+
+        if any(term in lower for term in ["mysql", "sql", "数据库校验", "查库", "数据校验"]):
+            self._handle_sql_check(text)
+            return True
+
+        if any(term in lower for term in ["生成jmeter", "导出jmx", "jmeter脚本", "jmeter"]):
+            self._export_jmeter_plan(text)
+            return True
+
+        if any(term in lower for term in ["docker日志", "docker logs", "k8s日志", "kubectl logs", "查看最近日志"]):
+            self._run_environment_logs(text)
+            return True
+
+        if any(term in lower for term in ["环境检查", "linux检查", "docker检查", "k8s检查", "检查docker", "检查k8s", "env check"]):
+            self._run_environment_check(text)
+            return True
+
+        if any(term in lower for term in ["回归对比", "对比上次", "对比会话", "compare regression", "regression compare"]):
+            self._compare_regression(text)
             return True
 
         if any(term in lower for term in ["生成报告", "测试报告", "导出报告", "report"]):
@@ -1660,6 +1813,278 @@ class MainAgent:
         self.context.reports.append(str(path))
         self.context.add_event("agent", f"生成报告 {fmt}", {"path": str(path)})
         print(f"  ✓ 报告已生成: {path}")
+
+    async def _generate_test_cases(self, text: str):
+        if not self.context.test_plan:
+            await self._generate_and_show_test_plan()
+        if not self.context.test_plan:
+            return
+        name = self._name_after_keyword(text, ["保存测试用例", "导出测试用例", "生成测试用例", "test case"]) or self.context.session_name
+        cases = self.case_manager.from_plan(self.context.test_plan, module=self.context.current_title or "Web")
+        paths = self.case_manager.save(name, cases)
+        record = {"name": name, "total": len(cases), "paths": paths, "created_at": datetime.now().isoformat(timespec="seconds")}
+        self.context.test_cases.append(record)
+        self.context.artifacts.extend(paths.values())
+        self.context.add_event("agent", "生成测试用例", record)
+        print("\n[测试用例中心]")
+        print(f"  ✓ 已生成 {len(cases)} 条测试用例")
+        print(f"  JSON: {paths['json']}")
+        print(f"  Markdown: {paths['markdown']}")
+        print(f"  CSV/Excel: {paths['csv']}")
+        print(f"  Excel: {paths['xlsx']}")
+
+    def _list_managed_test_cases(self):
+        items = self.case_manager.list_cases()
+        print("\n[用例列表]")
+        if not items:
+            print("  暂无本地用例。可以先说：生成测试用例")
+            return
+        for index, item in enumerate(items[:30], 1):
+            print(f"  {index}. {item['name']} | {item['total']} 条 | {item['updated_at']} | {item['path']}")
+
+    async def _run_managed_test_case(self, text: str):
+        name = self._name_after_keyword(text, ["运行用例", "执行用例", "run case"]) or self._extract_any_file_path(text, [".json"]) or ""
+        if not name:
+            print("  请指定用例名或 JSON 路径，例如：运行用例 login-case")
+            return
+        try:
+            payload = self.case_manager.load(name)
+        except Exception as e:
+            print(f"  ✗ 加载用例失败: {e}")
+            return
+        cases = payload.get("cases") or []
+        print(f"\n[运行测试用例] {payload.get('name')} | {len(cases)} 条")
+        executed = 0
+        for case in cases:
+            steps = case.get("steps") or []
+            if not steps:
+                continue
+            task = "，然后".join(str(step) for step in steps[:6])
+            print(f"  Case: {case.get('feature')} -> {task}")
+            await self._run_planned_task(task)
+            case["execution_result"] = "executed"
+            executed += 1
+        record = {"name": payload.get("name"), "executed": executed, "path": payload.get("path")}
+        self.context.test_cases.append(record)
+        self.context.add_event("agent", "运行测试用例", record)
+        print(f"  ✓ 用例执行完成: {executed}/{len(cases)}")
+
+    async def _generate_cases_from_requirement(self, text: str):
+        path = self._extract_any_file_path(text, [".md", ".txt"])
+        if not path:
+            print("  请提供需求文档路径，例如：根据需求文档 docs/login.md 生成测试用例")
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"  ✗ 读取需求文档失败: {e}")
+            return
+        name = Path(path).stem + "-cases"
+        cases = self.case_manager.from_requirements(content, module=Path(path).stem)
+        paths = self.case_manager.save(name, cases)
+        record = {"name": name, "source": path, "total": len(cases), "paths": paths}
+        self.context.test_cases.append(record)
+        self.context.artifacts.extend(paths.values())
+        self.context.add_event("agent", "根据需求文档生成测试用例", record)
+        print("\n[需求文档 -> 测试用例]")
+        print(f"  ✓ 已从需求文档生成 {len(cases)} 条用例")
+        print(f"  Markdown: {paths['markdown']}")
+        print(f"  CSV/Excel: {paths['csv']}")
+        print(f"  Excel: {paths['xlsx']}")
+
+    def _create_defect_ticket(self, text: str):
+        context_data = self.context.to_dict(redact=True)
+        context_data["network"] = self.network_recorder.summary()
+        severity = self._extract_severity(text)
+        title = self._name_after_keyword(text, ["生成缺陷", "创建缺陷", "提bug", "提 bug", "bug单", "defect"])
+        defect = self.defect_manager.create(context_data, title=title, severity=severity)
+        self.context.defects.append(defect)
+        self.context.artifacts.append(defect["path"])
+        self.context.add_event("agent", "生成缺陷单", defect)
+        print("\n[缺陷单]")
+        print(f"  ✓ 已生成 {defect['id']}: {defect['title']}")
+        print(f"  严重级别: {defect['severity']}")
+        print(f"  路径: {defect['path']}")
+
+    def _run_postman_collection(self, text: str):
+        path = self._extract_any_file_path(text, [".json"])
+        if not path:
+            print("  请提供 Postman Collection JSON，例如：运行Postman ./collection.json")
+            return
+        try:
+            env_path = self._extract_env_file_path(text)
+            result = self.postman_runner.run(path, env_path=env_path or "")
+        except Exception as e:
+            print(f"  ✗ Postman Collection 执行失败: {e}")
+            return
+        self.context.api_runs.append(result)
+        self.context.artifacts.append(result["report_path"])
+        self.context.add_event("agent", "运行 Postman Collection", result)
+        print("\n[Postman/API 测试]")
+        print(f"  Collection: {result['name']}")
+        print(f"  总数: {result['total']} | 通过: {result['passed']} | 失败: {result['failed']} | 耗时: {result['duration_ms']} ms")
+        print(f"  报告: {result['report_path']}")
+        if result.get("variables"):
+            print(f"  变量: {', '.join(result['variables'])}")
+
+    def _run_pytest_regression(self, text: str):
+        path = self._extract_any_file_path(text, [".py"]) or "tests"
+        if not Path(path).exists():
+            print(f"  ✗ pytest 路径不存在: {path}")
+            return
+        command = ["python", "-B", "-m", "pytest", path, "-q"]
+        print("\n[pytest 回归]")
+        print(f"  执行: {' '.join(command)}")
+        try:
+            completed = subprocess.run(command, cwd=str(Path.cwd()), capture_output=True, text=True, timeout=120, check=False)
+        except Exception as e:
+            print(f"  ✗ pytest 执行失败: {e}")
+            return
+        result = {
+            "command": " ".join(command),
+            "returncode": completed.returncode,
+            "stdout": (completed.stdout or "")[-4000:],
+            "stderr": (completed.stderr or "")[-2000:],
+        }
+        self.context.add_event("agent", "运行 pytest 回归", result)
+        print(f"  {'✓' if completed.returncode == 0 else '✗'} returncode={completed.returncode}")
+        output = (completed.stdout or completed.stderr or "").strip()
+        if output:
+            print("  输出摘要:")
+            for line in output.splitlines()[-12:]:
+                print(f"    {line[:180]}")
+
+    def _handle_sql_check(self, text: str):
+        if "配置" in text and "mysql" in text.lower():
+            config = self._parse_key_values(text, ["host", "port", "user", "password", "database"])
+            if not config:
+                print("  配置格式示例: 配置MySQL host=127.0.0.1 port=3306 user=root password=xxx database=test")
+                return
+            config_path = Path.home() / ".testforge" / "mysql.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  ✓ MySQL 配置已保存: {config_path}")
+            return
+
+        built = self.sql_workbench.build(text)
+        result = {"sql": built["sql"], "readonly": built["readonly"], "executed": False}
+        if any(term in text for term in ["执行", "运行", "execute"]):
+            config_path = Path.home() / ".testforge" / "mysql.json"
+            if config_path.exists():
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                exec_result = self.sql_workbench.execute(built["sql"], config)
+                result.update(exec_result)
+                result["executed"] = True
+            else:
+                result["warning"] = "未找到 ~/.testforge/mysql.json，仅生成 SQL"
+        self.context.sql_checks.append(result)
+        self.context.add_event("agent", "SQL/数据库校验", result)
+        print("\n[MySQL/SQL 校验]")
+        print(f"  SQL: {built['sql']}")
+        if result.get("executed"):
+            if result.get("ok"):
+                print(f"  ✓ 执行成功，影响/返回行数: {result.get('rowcount', 0)}")
+            else:
+                print(f"  ✗ 执行失败: {result.get('error')}")
+        else:
+            print("  提示: 如需真实执行，先配置 MySQL，然后说：执行SQL select ...")
+
+    def _export_jmeter_plan(self, text: str):
+        url = self._extract_url(text) or self.context.current_url or getattr(self.page, "url", "")
+        if not url or url == "about:blank":
+            print("  请指定 URL，例如：生成JMeter脚本 http://example.com 线程10 循环20")
+            return
+        threads = self._extract_number_after(text, ["线程", "threads"], default=10)
+        loops = self._extract_number_after(text, ["循环", "loops"], default=10)
+        name = self._name_after_keyword(text, ["生成jmeter", "导出jmx", "jmeter脚本", "jmeter"]) or self.context.session_name
+        expected_status = self._extract_number_after(text, ["状态码", "status"], default=200)
+        csv_path = self._extract_any_file_path(text, [".csv"]) or ""
+        path = self.jmeter_exporter.export(
+            url,
+            name=name,
+            threads=threads,
+            loops=loops,
+            expected_status=expected_status,
+            csv_path=csv_path,
+        )
+        record = {"url": url, "threads": threads, "loops": loops, "expected_status": expected_status, "csv": csv_path, "path": str(path)}
+        self.context.jmeter_plans.append(record)
+        self.context.artifacts.append(str(path))
+        self.context.add_event("agent", "生成 JMeter JMX", record)
+        print("\n[JMeter 脚本]")
+        print(f"  ✓ 已导出 JMX: {path}")
+        print(f"  线程: {threads} | 循环: {loops} | 状态码断言: {expected_status} | URL: {url}")
+        if csv_path:
+            print(f"  CSV 数据集: {csv_path}")
+
+    def _run_environment_check(self, text: str):
+        scope = "all"
+        lower = text.lower()
+        if "docker" in lower:
+            scope = "docker"
+        elif "k8s" in lower or "kubectl" in lower:
+            scope = "k8s"
+        elif "linux" in lower:
+            scope = "linux"
+        elif "git" in lower:
+            scope = "git"
+        result = self.environment_inspector.inspect(scope=scope, cwd=str(Path.cwd()))
+        self.context.environment_checks.append(result)
+        self.context.add_event("agent", "环境检查", result)
+        print("\n[环境检查]")
+        for item in result["results"]:
+            status = "✓" if item.get("ok") else "✗"
+            print(f"  {status} {item.get('command')}")
+            output = (item.get("stdout") or item.get("stderr") or item.get("error") or "").strip()
+            if output:
+                first_line = output.splitlines()[0][:180]
+                print(f"    {first_line}")
+
+    def _run_environment_logs(self, text: str):
+        lower = text.lower()
+        kind = "k8s" if "k8s" in lower or "kubectl" in lower else "docker"
+        target = self._name_after_keyword(text, ["docker日志", "docker logs", "k8s日志", "kubectl logs", "查看最近日志"])
+        if not target:
+            print("  请指定日志目标，例如：docker日志 container_name 或 k8s日志 pod_name")
+            return
+        result = self.environment_inspector.logs(target, kind=kind, cwd=str(Path.cwd()))
+        self.context.environment_checks.append(result)
+        self.context.add_event("agent", "环境日志检查", result)
+        print("\n[环境日志]")
+        for item in result["results"]:
+            status = "✓" if item.get("ok") else "✗"
+            print(f"  {status} {item.get('command')}")
+            output = (item.get("stdout") or item.get("stderr") or item.get("error") or "").strip()
+            if output:
+                for line in output.splitlines()[-10:]:
+                    print(f"    {line[:180]}")
+
+    def _compare_regression(self, text: str):
+        name = self._session_name_after_command(text) or self._name_after_keyword(text, ["回归对比", "对比会话", "compare regression"])
+        if not name:
+            sessions = self.session_store.list()
+            name = next((item["name"] for item in sessions if item["name"] != self.context.session_name), "")
+        if not name:
+            print("  请指定要对比的会话，例如：回归对比 blog-test")
+            return
+        try:
+            previous = self.session_store.load(name)
+        except FileNotFoundError as e:
+            print(f"  ✗ {e}")
+            return
+        result = self.regression_comparer.compare(previous, self.context.to_dict(redact=True))
+        self.context.regression_results.append(result)
+        self.context.add_event("agent", "回归对比", result)
+        print("\n[回归对比]")
+        print(f"  基线会话: {result['previous_session']} -> 当前会话: {result['current_session']}")
+        print(f"  失败数: {result['previous_failures']} -> {result['current_failures']}")
+        print(f"  新增失败: {result['new_failures']} | 已修复失败: {result['fixed_failures']}")
+        if result["new_tested_features"]:
+            print(f"  新增已测功能: {', '.join(result['new_tested_features'][:8])}")
+        if result.get("new_pages"):
+            print(f"  新增页面: {len(result['new_pages'])}")
+        if result.get("performance_delta"):
+            print(f"  性能差异: {result['performance_delta']}")
 
     def _show_network_report(self):
         summary = self.network_recorder.summary()
@@ -3449,6 +3874,16 @@ jobs:
   安全检查 / 无障碍检查        - 安全响应头、混合内容、a11y 基础检查
   保存基线 name / 视觉对比 name - 视觉回归基线和对比
   测试数据 用户/评论/文章      - 生成并记录测试数据
+  生成测试用例 / 导出测试用例   - 把测试计划保存为 JSON/Markdown/CSV/XLSX
+  用例列表 / 运行用例 login-case - 查看并执行本地沉淀用例
+  根据需求文档 docs/a.md 生成测试用例 - 从需求文档生成用例
+  生成缺陷 / 提Bug             - 根据最近失败和证据生成缺陷单
+  运行Postman collection.json 环境 env.json - 执行 Postman Collection 并替换变量
+  配置MySQL host=... / 执行SQL select ... - SQL 模板和可选数据库校验
+  运行pytest 回归 tests/testforge - 执行导出的 pytest/Playwright 回归
+  生成JMeter脚本 URL 线程10 循环20 状态码200 - 导出带断言的 JMX
+  环境检查 / docker检查 / k8s检查 / docker日志 web - 检查环境和最近日志
+  回归对比 blog-test           - 对比失败、页面、功能和性能差异
   生成报告 html/json/junit/all - 导出会话测试报告
   导出 Playwright 用例         - 将交互动作 IR 导出成 Playwright Python 测试骨架
   回归测试 blog-test           - 加载历史会话并重跑用户任务

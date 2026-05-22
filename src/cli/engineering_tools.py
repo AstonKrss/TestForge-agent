@@ -451,6 +451,13 @@ class ReportGenerator:
         ]
         artifacts = context.get("artifacts") or []
         reports = context.get("reports") or []
+        passed_events = [
+            event for event in events
+            if event.get("data", {}).get("result_type") in {"success", "done"}
+            or str(event.get("text", "")).startswith("✓")
+        ]
+        pass_rate = round((len(passed_events) / max(1, len(passed_events) + len(failures))) * 100, 1)
+        network = context.get("network") or {}
         lines = [
             f"# TestForge Report - {context.get('session_name', 'default')}",
             "",
@@ -459,6 +466,9 @@ class ReportGenerator:
             f"- Tested features: {', '.join(context.get('tested_features') or [])}",
             f"- Events: {len(events)}",
             f"- Failures: {len(failures)}",
+            f"- Pass rate: {pass_rate}%",
+            f"- Defects: {len(context.get('defects') or [])}",
+            f"- API failures: {network.get('failed', 0)}",
             f"- Evidence artifacts: {len(artifacts)}",
             "",
             "## Conclusion",
@@ -480,6 +490,29 @@ class ReportGenerator:
             lines.append(f"- **{item.get('feature')}** | risk={item.get('risk')} | login={item.get('needs_login')}")
             lines.append(f"  - Precondition: {item.get('precondition')}")
             lines.append(f"  - Expected: {item.get('expected')}")
+        lines.extend(["", "## QA Workbench"])
+        for item in context.get("test_cases") or []:
+            lines.append(f"- Test cases: {item.get('name')} | total={item.get('total')} | {item.get('paths', {})}")
+        for item in context.get("defects") or []:
+            lines.append(f"- Defect: {item.get('id')} {item.get('title')} | severity={item.get('severity')} | {item.get('path')}")
+        for item in context.get("api_runs") or []:
+            lines.append(f"- API run: {item.get('name')} | passed={item.get('passed')} failed={item.get('failed')} | {item.get('report_path')}")
+        for item in context.get("sql_checks") or []:
+            lines.append(f"- SQL: `{item.get('sql')}` | executed={item.get('executed')} | ok={item.get('ok', '')}")
+        for item in context.get("jmeter_plans") or []:
+            lines.append(f"- JMeter: {item.get('path')} | threads={item.get('threads')} loops={item.get('loops')}")
+        for item in context.get("environment_checks") or []:
+            ok_count = sum(1 for result in item.get("results", []) if result.get("ok"))
+            lines.append(f"- Environment: {item.get('scope')} | ok={ok_count}/{len(item.get('results', []))}")
+        for item in context.get("regression_results") or []:
+            lines.append(
+                f"- Regression: failures {item.get('previous_failures')} -> {item.get('current_failures')} "
+                f"| new={item.get('new_failures')} fixed={item.get('fixed_failures')}"
+            )
+        if network.get("slow"):
+            lines.extend(["", "## Slow API / Resources"])
+            for record in network.get("slow", [])[:10]:
+                lines.append(f"- {record.get('duration')} ms | {record.get('status')} | {record.get('method')} {record.get('url')}")
         lines.extend(["", "## Site Map"])
         site_map = context.get("site_map") or {}
         for item in (site_map.get("nodes") or site_map.get("links") or [])[:30]:

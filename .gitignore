@@ -33,6 +33,7 @@ Thumbs.db
 logs/
 
 # Test artifacts
+tests/.tmp/
 *.png
 *.jpg
 *.jpeg
