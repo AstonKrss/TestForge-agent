@@ -1219,12 +1219,14 @@ class MainAgent:
             return
 
         print("\n[一键全量测试]")
-        print("  范围: 测试计划、站点地图、质量、安全、无障碍、性能、低压压测、网络/API摘要、报告")
-        print("  安全策略: 只做 GET/HEAD 低压探测，不自动提交破坏性表单")
+        print("  范围: 测试计划、站点地图、入口冒烟、可执行功能流、质量、安全、无障碍、性能、低压压测、网络/API摘要、报告")
+        print("  安全策略: 可安全验证的功能会实际执行；发文章/评论等会创建数据的动作默认只做到提交前")
 
         await self._generate_and_show_test_plan()
         await self._generate_site_map()
+        suite_root_url = self.context.current_url or getattr(self.page, "url", "")
         await self._run_known_feature_suite("", from_full_suite=True)
+        await self._run_functional_flow_suite(suite_root_url)
         await self._run_quality_audit("")
         await self._run_security_audit("")
         await self._run_accessibility_audit("")
@@ -1417,6 +1419,491 @@ class MainAgent:
         if (user_input or "").lower().find("报告") >= 0 and not from_full_suite:
             await self._generate_report("生成报告 html")
 
+    async def _run_functional_flow_suite(self, original_url: str = ""):
+        """Run concrete non-destructive business flows for discovered features."""
+        print("\n[业务功能流测试]")
+        print("  FunctionalFlowAgent: 对可安全执行的功能做真实操作；需要凭证或会创建数据的步骤会标记为阻塞")
+
+        results: List[Dict[str, Any]] = []
+        await self._run_search_functional_flow(results)
+        await self._run_article_functional_flow(results)
+        await self._run_login_functional_flow(results)
+        await self._run_comment_functional_probe(results)
+        await self._run_discovered_feature_detail_flows(results)
+
+        if original_url and getattr(self.page, "url", "") != original_url:
+            try:
+                await self.executor.navigate(original_url)
+                self.context.add_page(original_url)
+            except Exception:
+                pass
+
+        passed = sum(1 for item in results if item.get("status") == "passed")
+        blocked = sum(1 for item in results if item.get("status") == "blocked")
+        failed = sum(1 for item in results if item.get("status") == "failed")
+        self.context.add_tested_feature("业务功能流测试")
+        self.context.add_event("agent", "业务功能流测试完成", {
+            "result_type": "success" if failed == 0 else "partial",
+            "passed": passed,
+            "blocked": blocked,
+            "failed": failed,
+            "results": results,
+        })
+        print(f"  ✓ 业务功能流测试完成: 通过 {passed} / 阻塞 {blocked} / 失败 {failed}")
+
+    async def _run_search_functional_flow(self, results: List[Dict[str, Any]]) -> None:
+        href = self._feature_or_common_href("search", ["/search"])
+        if not href:
+            self._append_flow_result(results, "搜索功能", "blocked", "未发现搜索入口")
+            return
+
+        print("  SearchFlowAgent: 搜索功能 - 输入关键词并校验结果")
+        nav = await self.executor.navigate(href)
+        if not nav.ok:
+            self._append_flow_result(results, "搜索功能", "failed", nav.reason, {"href": href})
+            print(f"    ✗ 搜索页打开失败: {nav.reason}")
+            return
+
+        keyword = await self._infer_search_keyword()
+        fill = await self.executor.fill(description="搜索输入框", text=keyword)
+        if not fill.ok:
+            fill = await self.executor.fill(description="输入关键词搜索...", text=keyword)
+        if not fill.ok:
+            self._append_flow_result(results, "搜索功能", "failed", f"找不到搜索输入框: {fill.reason}", {"href": href})
+            print(f"    ✗ 找不到搜索输入框: {fill.reason}")
+            return
+
+        clicked = await self.executor.click(description="搜索按钮")
+        if not clicked.ok:
+            clicked = await self.executor.click(description="搜索")
+        await self.executor.wait(0.6)
+
+        snapshot = await self.executor.get_snapshot()
+        page_text = (snapshot.data.get("text") or "").lower() if snapshot.ok else ""
+        current_url = getattr(self.page, "url", "")
+        extracted = await self.executor.extract_search_results()
+        total = extracted.data.get("total", 0) if extracted.ok else 0
+        ok = keyword.lower() in (current_url + " " + page_text).lower() or total > 0
+        status = "passed" if ok else "failed"
+        reason = f"关键词 {keyword} 搜索完成，结果 {total} 条" if ok else f"搜索后未观察到关键词 {keyword} 或结果列表"
+        self._append_flow_result(results, "搜索功能", status, reason, {
+            "keyword": keyword,
+            "url": current_url,
+            "result_count": total,
+            "submit_clicked": clicked.ok,
+        })
+        print(f"    {'✓' if ok else '✗'} {reason}")
+
+        if extracted.ok and total > 0:
+            opened = await self._open_first_extracted_search_result(extracted)
+            if opened and opened.ok:
+                self._append_flow_result(results, "搜索结果文章打开", "passed", opened.summary, opened.data)
+                print(f"    ✓ {opened.summary}")
+            elif opened:
+                self._append_flow_result(results, "搜索结果文章打开", "failed", opened.reason)
+
+    async def _run_article_functional_flow(self, results: List[Dict[str, Any]]) -> None:
+        print("  ArticleFlowAgent: 文章阅读 - 打开文章并检查正文")
+        current_url = getattr(self.page, "url", "")
+        if "/blog/" not in current_url:
+            list_href = self._feature_or_common_href("article_list", ["/blog"])
+            if not list_href:
+                self._append_flow_result(results, "文章阅读", "blocked", "未发现文章列表入口")
+                return
+            nav = await self.executor.navigate(list_href)
+            if not nav.ok:
+                self._append_flow_result(results, "文章阅读", "failed", nav.reason, {"href": list_href})
+                print(f"    ✗ 文章列表打开失败: {nav.reason}")
+                return
+            extracted = await self.executor.extract_search_results()
+            if not extracted.ok or not extracted.data.get("results"):
+                self._append_flow_result(results, "文章阅读", "failed", "文章列表中未提取到文章链接")
+                print("    ✗ 文章列表中未提取到文章链接")
+                return
+            opened = await self._open_first_extracted_search_result(extracted)
+            if not opened or not opened.ok:
+                self._append_flow_result(results, "文章阅读", "failed", opened.reason if opened else "没有可打开的文章链接")
+                print(f"    ✗ 文章打开失败: {opened.reason if opened else '没有可打开的文章链接'}")
+                return
+
+        article = await self.executor.extract_article_content()
+        data = article.data if article.ok else {}
+        text = data.get("text") or ""
+        headings = data.get("headings") or []
+        ok = bool(data.get("title")) and len(text) >= 80
+        status = "passed" if ok else "failed"
+        reason = f"文章正文可读取，标题: {data.get('title', '')[:40]}，标题层级 {len(headings)} 个" if ok else "文章标题或正文为空，疑似详情页内容不完整"
+        self._append_flow_result(results, "文章阅读", status, reason, {
+            "url": data.get("url") or getattr(self.page, "url", ""),
+            "title": data.get("title", ""),
+            "heading_count": len(headings),
+            "text_length": len(text),
+        })
+        print(f"    {'✓' if ok else '✗'} {reason}")
+
+    async def _run_login_functional_flow(self, results: List[Dict[str, Any]]) -> None:
+        href = self._feature_or_common_href("login", ["/login"])
+        if not href:
+            self._append_flow_result(results, "登录/认证", "blocked", "未发现登录入口")
+            return
+
+        print("  AuthFlowAgent: 登录/认证 - 检查字段，若已有凭证则提交并验证")
+        nav = await self.executor.navigate(href)
+        if not nav.ok:
+            self._append_flow_result(results, "登录/认证", "failed", nav.reason, {"href": href})
+            print(f"    ✗ 登录页打开失败: {nav.reason}")
+            return
+
+        detect = await self.executor.detect_login_page()
+        if detect.type == ResultType.NO_AUTH_NEEDED:
+            self.context.is_logged_in = True
+            self._append_flow_result(results, "登录/认证", "passed", detect.summary or "已检测到登录状态")
+            print(f"    ✓ {detect.summary or '已检测到登录状态'}")
+            return
+
+        if detect.type != ResultType.ASK_USER:
+            self._append_flow_result(results, "登录/认证", "failed", detect.reason or "未识别登录表单")
+            print(f"    ✗ {detect.reason or '未识别登录表单'}")
+            return
+
+        fields = detect.data.get("required_fields", [])
+        probed_register = await self._run_register_probe_from_current_page(results)
+        username = self.context.credentials.get("username", "")
+        password = self.context.credentials.get("password", "")
+        if not (username and password):
+            self._append_flow_result(results, "登录/认证", "blocked", f"识别到字段 {', '.join(fields)}，但缺少账号或密码", {"fields": fields})
+            print(f"    ! 已识别登录字段: {', '.join(fields)}；缺少凭证，未提交登录")
+            return
+
+        if probed_register:
+            await self.executor.navigate(href)
+        login = await self.executor.login(username, password)
+        if login.ok:
+            self.context.is_logged_in = True
+            self.context.logged_in_user = username
+            self._append_flow_result(results, "登录/认证", "passed", login.summary, {"fields": fields})
+            print(f"    ✓ {login.summary}")
+        else:
+            self.context.is_logged_in = False
+            self._append_flow_result(results, "登录/认证", "failed", login.reason, {"fields": fields})
+            print(f"    ✗ 登录失败: {login.reason}")
+
+    async def _run_comment_functional_probe(self, results: List[Dict[str, Any]]) -> None:
+        href = self._feature_or_common_href("comment", ["/guestbook"])
+        if not href:
+            self._append_flow_result(results, "评论/留言", "blocked", "未发现评论或留言入口")
+            return
+
+        print("  CommentFlowAgent: 评论/留言 - 检查前置条件和表单，不自动发布真实评论")
+        nav = await self.executor.navigate(href)
+        if not nav.ok:
+            self._append_flow_result(results, "评论/留言", "failed", nav.reason, {"href": href})
+            print(f"    ✗ 评论/留言页打开失败: {nav.reason}")
+            return
+
+        auth = await self.executor.extract_auth_requirements()
+        forms = await self.executor.extract_forms()
+        form_count = forms.data.get("total", 0) if forms.ok else 0
+        auth_required = bool(auth.ok and auth.data.get("auth_required"))
+        if auth_required and not self.context.is_logged_in:
+            self._append_flow_result(results, "评论/留言", "blocked", "页面提示需要登录；未发布评论", {"form_count": form_count})
+            print("    ! 页面提示需要登录；未发布评论")
+            return
+        if form_count > 0:
+            self._append_flow_result(results, "评论/留言", "passed", "评论/留言表单存在；已停在提交前，避免创建真实数据", {"form_count": form_count})
+            print("    ✓ 评论/留言表单存在；已停在提交前")
+            return
+        self._append_flow_result(results, "评论/留言", "blocked", "未发现可填写的评论/留言表单", {"form_count": form_count})
+        print("    ! 未发现可填写的评论/留言表单")
+
+    async def _run_register_probe_from_current_page(self, results: List[Dict[str, Any]]) -> bool:
+        """Probe register links exposed from the current login/auth page."""
+        snapshot = await self.executor.get_snapshot()
+        if not snapshot.ok:
+            return False
+        current_url = getattr(self.page, "url", "") or self.context.current_url
+        for element in snapshot.data.get("elements") or []:
+            href = element.get("href") or ""
+            blob = " ".join(str(element.get(key, "")) for key in ("text", "ariaLabel", "label", "href", "id", "name")).lower()
+            if not href or not any(term in blob for term in ["注册", "立即注册", "register", "signup", "sign up"]):
+                continue
+            if href.startswith("/"):
+                href = self._join_origin(current_url, href)
+            print(f"    RegisterFlowAgent: 注册入口 -> {href}")
+            nav = await self.executor.navigate(href)
+            if not nav.ok:
+                self._append_flow_result(results, "注册入口", "failed", nav.reason, {"href": href})
+                print(f"      ✗ 注册入口打开失败: {nav.reason}")
+                return True
+
+            register_snapshot = await self.executor.get_snapshot()
+            snapshot_data = register_snapshot.data if register_snapshot.ok else {}
+            broken_reason = self._page_broken_reason(snapshot_data)
+            if broken_reason:
+                self._append_flow_result(results, "注册入口", "failed", broken_reason, {"href": href})
+                print(f"      ✗ 注册页异常: {broken_reason}")
+                return True
+
+            forms = await self.executor.extract_forms()
+            fields = [
+                field
+                for form in (forms.data.get("forms", []) if forms.ok else [])
+                for field in form.get("fields", [])
+            ]
+            input_count = len(fields) or len([
+                e for e in snapshot_data.get("elements", [])
+                if e.get("tag") in ("input", "textarea", "select")
+            ])
+            status = "passed" if input_count else "blocked"
+            reason = "注册入口可访问，已识别注册表单/输入字段，未提交注册" if input_count else "注册入口可访问，但未发现输入字段"
+            self._append_flow_result(results, "注册入口", status, reason, {"href": href, "input_count": input_count})
+            print(f"      {'✓' if status == 'passed' else '!'} {reason}")
+            return True
+        return False
+
+    async def _run_discovered_feature_detail_flows(self, results: List[Dict[str, Any]]) -> None:
+        """Visit discovered feature pages and run page-specific assertions."""
+        candidates = self._deep_feature_candidates()
+        if not candidates:
+            return
+
+        print("  DiscoveredFeatureAgent: 发现功能深度测试 - 逐个进入主要功能页并断言页面特征")
+        for candidate in candidates:
+            label = candidate.get("label", "")
+            href = candidate.get("href", "")
+            feature = candidate.get("feature", "功能页")
+            print(f"    - {feature}: {label} -> {href}")
+            nav = await self.executor.navigate(href)
+            if not nav.ok:
+                self._append_flow_result(results, feature, "failed", nav.reason, {"href": href})
+                print(f"      ✗ 打开失败: {nav.reason}")
+                continue
+
+            snapshot = await self.executor.get_snapshot()
+            snapshot_data = snapshot.data if snapshot.ok else {}
+            broken_reason = self._page_broken_reason(snapshot_data)
+            if broken_reason:
+                self._append_flow_result(results, feature, "failed", broken_reason, {"href": href})
+                print(f"      ✗ 页面异常: {broken_reason}")
+                continue
+
+            verdict = await self._inspect_deep_feature_page(candidate, snapshot_data)
+            self._append_flow_result(results, feature, verdict["status"], verdict["reason"], verdict.get("data", {}))
+            marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
+            print(f"      {marker} {verdict['reason']}")
+
+    def _deep_feature_candidates(self) -> List[Dict[str, str]]:
+        site_map = self.context.site_map or {}
+        nodes = site_map.get("nodes") or site_map.get("links") or []
+        selected: List[Dict[str, str]] = []
+        seen: set[str] = set()
+
+        for node in nodes:
+            if not node.get("same_origin", True):
+                continue
+            href = node.get("href", "")
+            if not href:
+                continue
+            label = node.get("text") or self._label_from_href(href)
+            if self._is_unsafe_feature_href(label, href):
+                continue
+            feature = self._classify_deep_feature(label, href)
+            if not feature:
+                continue
+            key = href.split("#")[0]
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append({"label": label[:80], "href": href, "feature": feature})
+
+        priority = {
+            "搜索功能": 0,
+            "登录/认证": 1,
+            "注册入口": 2,
+            "留言/评论": 3,
+            "博客列表": 4,
+            "归档": 5,
+            "标签": 6,
+            "友链": 7,
+            "项目": 8,
+            "工具箱": 9,
+            "游戏": 10,
+            "相册": 11,
+            "旅行": 12,
+            "关于": 13,
+            "资源": 14,
+            "时间线": 15,
+            "碎碎念": 16,
+            "RSS": 17,
+            "终端/全屏": 18,
+        }
+        selected.sort(key=lambda item: (priority.get(item["feature"], 99), item["href"]))
+        return selected[:24]
+
+    def _classify_deep_feature(self, label: str, href: str) -> str:
+        try:
+            path = urlparse(href).path.lower()
+        except Exception:
+            path = href.lower()
+        blob = f"{label} {path}".lower()
+        checks = [
+            ("搜索功能", ["搜索", "search", "/search"]),
+            ("登录/认证", ["登录", "login", "signin", "/login"]),
+            ("注册入口", ["注册", "register", "signup", "/register"]),
+            ("留言/评论", ["留言", "评论", "guestbook", "comment", "/guestbook"]),
+            ("博客列表", ["博客", "blog", "/blog"]),
+            ("归档", ["归档", "archive", "/archive"]),
+            ("标签", ["标签", "tag", "/tags"]),
+            ("友链", ["友链", "friends", "/friends"]),
+            ("项目", ["项目", "project", "/projects"]),
+            ("工具箱", ["工具箱", "工具", "tool", "/tools"]),
+            ("游戏", ["游戏", "game", "/games"]),
+            ("相册", ["相册", "photo", "/photos"]),
+            ("旅行", ["旅行", "travel", "/travel"]),
+            ("关于", ["关于", "about", "/about"]),
+            ("资源", ["资源", "resource", "/resources"]),
+            ("时间线", ["时间线", "成长轨迹", "timeline", "/timeline"]),
+            ("碎碎念", ["碎碎念", "notes", "/notes"]),
+            ("RSS", ["rss", "/rss"]),
+            ("终端/全屏", ["终端", "全屏", "terminal", "/terminal"]),
+        ]
+        for feature, terms in checks:
+            if any(term in blob for term in terms):
+                if feature == "博客列表" and "/blog/" in path:
+                    return ""
+                return feature
+        return ""
+
+    def _label_from_href(self, href: str) -> str:
+        try:
+            path = urlparse(href).path.strip("/")
+        except Exception:
+            path = href.strip("/")
+        return path or "首页"
+
+    async def _inspect_deep_feature_page(self, candidate: Dict[str, str], snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        feature = candidate.get("feature", "")
+        elements = snapshot.get("elements") or []
+        text = snapshot.get("text") or ""
+        href = candidate.get("href", "")
+        links = [e for e in elements if e.get("href")]
+        inputs = [e for e in elements if e.get("tag") in ("input", "textarea", "select")]
+        buttons = [e for e in elements if e.get("tag") == "button" or e.get("role") == "button"]
+        blog_links = [
+            e for e in links
+            if "/blog/" in str(e.get("href", "")) and not str(e.get("href", "")).rstrip("/").endswith("/blog")
+        ]
+        external_links = [
+            e for e in links
+            if str(e.get("href", "")).startswith(("http://", "https://"))
+            and urlparse(str(e.get("href", ""))).netloc != urlparse(href).netloc
+        ]
+        data = {
+            "href": href,
+            "title": snapshot.get("title", ""),
+            "text_length": len(text),
+            "link_count": len(links),
+            "input_count": len(inputs),
+            "button_count": len(buttons),
+            "blog_link_count": len(blog_links),
+            "external_link_count": len(external_links),
+        }
+
+        if feature == "登录/认证":
+            detect = await self.executor.detect_login_page()
+            if detect.type == ResultType.NO_AUTH_NEEDED:
+                return {"status": "passed", "reason": detect.summary or "已检测到登录状态", "data": data}
+            fields = detect.data.get("required_fields", []) if detect.type == ResultType.ASK_USER else []
+            if fields:
+                data["fields"] = fields
+                return {"status": "passed", "reason": f"登录页字段识别成功: {', '.join(fields)}", "data": data}
+            return {"status": "failed", "reason": detect.reason or "登录页未识别账号密码字段", "data": data}
+
+        if feature == "注册入口":
+            forms = await self.executor.extract_forms()
+            form_count = forms.data.get("total", 0) if forms.ok else 0
+            data["form_count"] = form_count
+            if form_count or inputs:
+                return {"status": "passed", "reason": "注册入口可访问，已识别表单/输入字段，未提交注册", "data": data}
+            return {"status": "blocked", "reason": "注册入口可访问，但未发现可填写表单", "data": data}
+
+        if feature == "搜索功能":
+            if inputs:
+                return {"status": "passed", "reason": f"搜索页可访问，发现 {len(inputs)} 个输入字段", "data": data}
+            return {"status": "failed", "reason": "搜索页可访问，但没有搜索输入框", "data": data}
+
+        if feature in {"归档", "标签", "博客列表"}:
+            if blog_links:
+                return {"status": "passed", "reason": f"{feature}可访问，发现 {len(blog_links)} 个文章链接", "data": data}
+            if len(text.strip()) >= 80:
+                return {"status": "passed", "reason": f"{feature}可访问，页面内容非空，但未提取到文章链接", "data": data}
+            return {"status": "failed", "reason": f"{feature}页面内容过少或无结果", "data": data}
+
+        if feature == "留言/评论":
+            auth = await self.executor.extract_auth_requirements()
+            forms = await self.executor.extract_forms()
+            form_count = forms.data.get("total", 0) if forms.ok else 0
+            data["form_count"] = form_count
+            data["auth_required"] = bool(auth.ok and auth.data.get("auth_required"))
+            if data["auth_required"]:
+                return {"status": "passed", "reason": "留言/评论页可访问，正确提示需要登录", "data": data}
+            if form_count or inputs:
+                return {"status": "passed", "reason": "留言/评论表单存在，未自动提交真实内容", "data": data}
+            return {"status": "blocked", "reason": "留言/评论页可访问，但未发现表单或登录提示", "data": data}
+
+        if feature == "友链":
+            if external_links:
+                return {"status": "passed", "reason": f"友链页可访问，发现 {len(external_links)} 个外部链接", "data": data}
+            return {"status": "blocked", "reason": "友链页可访问，但未发现外部链接", "data": data}
+
+        if feature in {"项目", "工具箱", "游戏", "相册", "旅行", "关于", "资源", "时间线", "碎碎念", "终端/全屏", "RSS"}:
+            if len(text.strip()) >= 40 or links or buttons:
+                return {
+                    "status": "passed",
+                    "reason": f"{feature}页可访问，内容/链接/按钮检查通过",
+                    "data": data,
+                }
+            return {"status": "failed", "reason": f"{feature}页内容过少，疑似空页面", "data": data}
+
+        if len(text.strip()) >= 40:
+            return {"status": "passed", "reason": f"{feature}可访问，页面内容非空", "data": data}
+        return {"status": "failed", "reason": f"{feature}页面内容过少", "data": data}
+
+    def _append_flow_result(
+        self,
+        results: List[Dict[str, Any]],
+        feature: str,
+        status: str,
+        reason: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        results.append({
+            "feature": feature,
+            "status": status,
+            "ok": status == "passed",
+            "reason": reason,
+            "data": data or {},
+        })
+
+    def _feature_or_common_href(self, feature: str, common_paths: List[str]) -> str:
+        href = self._feature_href(feature)
+        if href:
+            return href
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        for path in common_paths:
+            joined = self._join_origin(current_url, path)
+            if joined:
+                return joined
+        return ""
+
+    async def _infer_search_keyword(self) -> str:
+        snapshot = await self.executor.get_snapshot()
+        text = (snapshot.data.get("text") or "").lower() if snapshot.ok else ""
+        for candidate in ["linux", "数据库", "python", "test"]:
+            if candidate.lower() in text:
+                return candidate
+        return "test"
+
     def _known_feature_candidates(self, site_map: Dict[str, Any]) -> List[Dict[str, str]]:
         current_url = self.context.current_url or getattr(self.page, "url", "")
         host = urlparse(current_url or "").netloc or "unknown"
@@ -1566,8 +2053,13 @@ class MainAgent:
         if not nav.ok:
             results.append({"feature": "login", "label": "登录", "href": login_href, "ok": False, "reason": nav.reason})
             return
-        auth = await self.executor.extract_auth_requirements()
-        fields = auth.data.get("required_fields", []) if auth.ok else []
+        auth = await self.executor.detect_login_page()
+        if auth.type == ResultType.NO_AUTH_NEEDED:
+            fields = ["已登录"]
+        elif auth.type == ResultType.ASK_USER:
+            fields = auth.data.get("required_fields", [])
+        else:
+            fields = []
         ok = bool(fields)
         results.append({"feature": "login", "label": "登录字段", "href": login_href, "ok": ok, "fields": fields, "reason": "" if ok else "未识别登录字段"})
         print(f"    ✓ 登录字段: {', '.join(fields)}" if ok else "    ✗ 未识别登录字段")

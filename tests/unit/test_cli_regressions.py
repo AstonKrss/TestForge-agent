@@ -232,3 +232,66 @@ def test_page_broken_reason_detects_404():
     })
 
     assert "404" in reason
+
+
+def test_feature_or_common_href_falls_back_to_site_path():
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext()
+    agent.context.add_page("http://example.com/blog")
+    agent.page = type("Page", (), {"url": "http://example.com/blog"})()
+
+    assert agent._feature_or_common_href("search", ["/search"]) == "http://example.com/search"
+
+
+def test_smoke_login_entry_uses_login_page_detector():
+    class FakeExecutor:
+        async def navigate(self, href):
+            return ExecutorResult(type=ResultType.SUCCESS, data={"url": href})
+
+        async def detect_login_page(self):
+            return ExecutorResult(
+                type=ResultType.ASK_USER,
+                data={"required_fields": ["username", "password"]},
+            )
+
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext()
+    agent.context.add_page("http://example.com/")
+    agent.context.known_feature_map = {
+        "example.com": {"login": {"href": "http://example.com/login", "label": "登录"}}
+    }
+    agent.page = type("Page", (), {"url": "http://example.com/"})()
+    agent.executor = FakeExecutor()
+    results = []
+
+    asyncio.run(agent._smoke_test_login_entry(results))
+
+    assert results[0]["ok"] is True
+    assert results[0]["fields"] == ["username", "password"]
+
+
+def test_deep_feature_classifier_covers_site_sections():
+    agent = MainAgent.__new__(MainAgent)
+
+    assert agent._classify_deep_feature("归档", "http://example.com/archive") == "归档"
+    assert agent._classify_deep_feature("工具箱", "http://example.com/tools") == "工具箱"
+    assert agent._classify_deep_feature("趣味游戏", "http://example.com/games") == "游戏"
+    assert agent._classify_deep_feature("立即注册", "http://example.com/register") == "注册入口"
+    assert agent._classify_deep_feature("文章标题", "http://example.com/blog/post-1") == ""
+
+
+def test_deep_feature_candidates_use_sitemap_major_sections():
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext()
+    agent.context.site_map = {
+        "nodes": [
+            {"text": "归档", "href": "http://example.com/archive", "same_origin": True},
+            {"text": "工具箱", "href": "http://example.com/tools", "same_origin": True},
+            {"text": "博客 文章A", "href": "http://example.com/blog/a", "same_origin": True},
+            {"text": "GitHub", "href": "https://github.com/example", "same_origin": False},
+        ]
+    }
+
+    candidates = agent._deep_feature_candidates()
+
+    assert [item["feature"] for item in candidates] == ["归档", "工具箱"]

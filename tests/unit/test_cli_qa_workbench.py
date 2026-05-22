@@ -156,7 +156,16 @@ def test_jmeter_exporter_writes_jmx():
         text = path.read_text(encoding="utf-8")
         assert "HTTPSampler.domain" in text
         assert "example.com" in text
+        assert "HTTP Request Defaults" in text
+        assert "HTTP Header Manager" in text
+        assert "HTTP Cookie Manager" in text
+        assert "HTTP Cache Manager" in text
+        assert "ThreadGroup.main_controller" in text
         assert "ResponseAssertion" in text
+        assert "DurationAssertion" in text
+        assert "Aggregate Report" in text
+        assert "Simple Data Writer" in text
+        assert ".jtl" in text
         assert "api-login" in str(path)
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)

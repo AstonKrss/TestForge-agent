@@ -6,7 +6,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue">
   <img alt="Playwright" src="https://img.shields.io/badge/Browser-Playwright-45ba63">
   <img alt="AI Agents" src="https://img.shields.io/badge/AI-Multi--Agent-purple">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-167%20passed-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-171%20passed-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
 </p>
 
@@ -123,6 +123,9 @@ The full suite runs:
 
 - site exploration and sitemap
 - site-specific test matrix
+- known feature smoke testing
+- executable functional flows for safe paths such as search, article reading, login verification, and comment prerequisites
+- deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, travel, resources, RSS, terminal, register, and guestbook
 - page quality audit
 - basic security audit
 - accessibility audit
@@ -342,7 +345,7 @@ python -m pytest tests/unit/ -q
 Current baseline:
 
 ```text
-167 passed
+171 passed
 ```
 
 ## Roadmap

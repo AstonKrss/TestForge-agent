@@ -52,6 +52,9 @@ Full suite includes:
 
 - test plan
 - sitemap
+- known feature smoke test
+- executable safe functional flows such as search, article reading, login verification, and comment prerequisites
+- deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, resources, RSS, register, and guestbook
 - quality audit
 - security audit
 - accessibility audit
