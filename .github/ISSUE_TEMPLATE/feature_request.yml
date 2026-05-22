@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest an improvement for TestForge
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What testing workflow should be easier?
+      placeholder: "As a tester, I want TestForge to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should TestForge do?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - PlanningAgent
+        - BrowserAgent
+        - ExplorerAgent
+        - VerifierAgent
+        - Reports
+        - Sessions / regression
+        - Performance / load testing
+        - Security / accessibility
+        - Documentation
+        - Other
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Example commands or output
+      placeholder: |
+        完整测试 http://example.com
+        测试评论功能，如果需要登录就先登录

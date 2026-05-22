@@ -12,7 +12,7 @@ TestForge - AI驱动的Web测试自动化框架
 - Test Evolution - 从失败中学习
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .src.smart_wait import SmartWait, create_smart_wait, WaitConfig, WaitStrategy
 from .src.intent_engine import IntentEngine, Intent, IntentType, create_intent_engine

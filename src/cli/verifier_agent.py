@@ -55,17 +55,63 @@ class VerifierAgent:
                 return VerificationResult(False, "点击搜索后页面没有进入搜索状态", needs_replan=True)
             if any(term in desc for term in ["点赞", "赞", "like"]):
                 text = (after.get("text") or "").lower()
+                if self._has_auth_required(text, after.get("elements") or []):
+                    return VerificationResult(
+                        False,
+                        "点赞动作被登录要求阻塞",
+                        needs_replan=True,
+                        suggestion="先执行登录，登录后回到原文章继续点赞",
+                    )
                 if any(term in text for term in ["已赞", "已点赞", "取消赞", "unlike", "liked"]):
                     return VerificationResult(True)
                 return VerificationResult(False, "点击点赞后没有检测到点赞成功标识", needs_replan=True)
+            if any(term in desc for term in ["评论", "留言", "comment", "提交"]):
+                text = (after.get("text") or "").lower()
+                if self._has_auth_required(text, after.get("elements") or []):
+                    return VerificationResult(
+                        False,
+                        "评论动作被登录要求阻塞",
+                        needs_replan=True,
+                        suggestion="先执行登录，登录后回到原页面继续评论",
+                    )
 
         if action_type == "fill":
+            text = (after.get("text") or "").lower()
+            if any(term in desc for term in ["评论", "留言", "comment"]) and self._has_auth_required(text, after.get("elements") or []):
+                return VerificationResult(
+                    False,
+                    "评论输入框需要登录后才能使用",
+                    needs_replan=True,
+                    suggestion="点击页面登录入口并在登录后继续原评论任务",
+                )
             return VerificationResult(True)
 
         if action_type in {"assert_text", "assert_visible"}:
             return VerificationResult(True)
 
         return VerificationResult(True)
+
+    def _has_auth_required(self, text: str, elements: List[Dict[str, Any]]) -> bool:
+        terms = [
+            "请登录",
+            "请先登录",
+            "登录后",
+            "点击登录",
+            "需要登录",
+            "未登录",
+            "login required",
+            "please login",
+            "please log in",
+            "sign in to",
+        ]
+        lower = (text or "").lower()
+        if any(term.lower() in lower for term in terms):
+            return True
+        for element in elements or []:
+            blob = " ".join(str(element.get(key, "")) for key in ("text", "label", "ariaLabel", "placeholder", "href")).lower()
+            if any(term.lower() in blob for term in terms):
+                return True
+        return False
 
     def evaluate_task(self, state: TaskState, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         state.update_from_snapshot(snapshot)

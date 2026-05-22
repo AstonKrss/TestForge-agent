@@ -58,8 +58,13 @@ class TaskState:
         if any(term in lower for term in ["搜索", "search", "查询"]):
             goals.append(TaskGoal("search", f"搜索 {keyword or '指定关键词'}", {"keyword": keyword}))
 
-        wants_article = any(term in lower for term in ["文章", "详情", "全文", "第一篇"]) or any(
+        wants_write_article = any(term in lower for term in ["写文章", "发文章", "发布文章", "write article", "new post", "create post"])
+        wants_article = (
+            any(term in lower for term in ["详情", "全文", "第一篇"])
+            or ("文章" in lower and not wants_write_article)
+            or any(
             term in lower for term in ["点赞", "赞", "like", "评论", "留言", "comment"]
+            )
         )
         if wants_article:
             goals.append(TaskGoal("open_article", "进入文章详情页"))
@@ -69,6 +74,18 @@ class TaskState:
 
         if any(term in lower for term in ["评论", "留言", "comment"]):
             goals.append(TaskGoal("comment", f"发表评论 {comment or ''}".strip(), {"text": comment}))
+
+        if wants_write_article:
+            goals.append(TaskGoal("write_article", "进入写文章编辑页并验证发布前流程"))
+
+        if any(term in lower for term in ["压力测试", "测试压力", "压测", "负载测试", "并发测试", "load test", "stress test"]):
+            goals.append(TaskGoal("load_test", "执行压力测试"))
+
+        if any(term in lower for term in ["性能测试", "页面质量", "质量检查", "安全检查", "安全基础测试", "无障碍", "可访问性", "performance", "audit", "security", "a11y"]):
+            goals.append(TaskGoal("audit", "执行工程审计"))
+
+        if any(term in lower for term in ["生成报告", "测试报告", "导出报告", "report"]):
+            goals.append(TaskGoal("report", "生成测试报告"))
 
         if not goals:
             goals.append(TaskGoal("generic", "执行用户请求"))
@@ -117,6 +134,14 @@ class TaskState:
                     goal.status = DONE
                 elif has_auth_required(text, elements):
                     goal.reason = "页面仍提示需要登录"
+            elif goal.type == "write_article":
+                editor_terms = ["输入文章标题", "文章标题", "预览", "发布", "正文", "markdown", "write"]
+                if any(path in url for path in ["/dashboard/write", "/write", "/editor"]) or any(term in text for term in editor_terms):
+                    goal.status = DONE
+                else:
+                    goal.reason = "尚未进入写文章编辑页"
+            elif goal.type in {"load_test", "audit", "report"}:
+                goal.reason = "等待工具执行结果"
 
     def is_done(self) -> bool:
         return all(goal.done for goal in self.goals)

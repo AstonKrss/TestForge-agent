@@ -30,6 +30,20 @@ from dataclasses import dataclass, field
 from ..ai_client import create_ai_client, AIClient
 from .executor_agent import ExecutorAgent, ExecutorResult, ResultType
 from .agent_plan import AgentAction, AgentPlan, extract_json_payload, normalize_agent_plan
+from .engineering_tools import (
+    EvidenceCollector,
+    LocatorMemory,
+    NetworkRecorder,
+    ReportGenerator,
+    TestDataManager,
+    TestPlanGenerator,
+    UrlScope,
+    VisualRegression,
+    build_site_map,
+    explore_site_map,
+    write_exploration_artifacts,
+)
+from ..ir.writer import IRWriter
 from .planning_agent import PlanningAgent
 from .session_store import SessionStore
 from .task_state import TaskState, extract_comment_text, extract_search_keyword
@@ -45,6 +59,7 @@ class SessionContext:
     """会话上下文"""
     # 会话元信息
     session_name: str = "default"
+    run_id: str = field(default_factory=lambda: datetime.now().strftime("%Y%m%d-%H%M%S"))
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = ""
     events: List[Dict[str, Any]] = field(default_factory=list)
@@ -72,6 +87,12 @@ class SessionContext:
     last_failed_action: Dict[str, Any] = field(default_factory=dict)
     known_feature_map: Dict[str, Any] = field(default_factory=dict)
     known_selectors: Dict[str, str] = field(default_factory=dict)
+    test_plan: List[Dict[str, Any]] = field(default_factory=list)
+    generated_data: List[Dict[str, Any]] = field(default_factory=list)
+    artifacts: List[str] = field(default_factory=list)
+    reports: List[str] = field(default_factory=list)
+    site_map: Dict[str, Any] = field(default_factory=dict)
+    visual_results: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_page(self, url: str, title: str = ""):
         self.current_url = url
@@ -109,6 +130,7 @@ class SessionContext:
             credentials["password"] = "***"
         return {
             "session_name": self.session_name,
+            "run_id": self.run_id,
             "created_at": self.created_at,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "current_url": self.current_url,
@@ -123,6 +145,12 @@ class SessionContext:
             "last_failed_action": dict(self.last_failed_action),
             "known_feature_map": dict(self.known_feature_map),
             "known_selectors": dict(self.known_selectors),
+            "test_plan": list(self.test_plan),
+            "generated_data": list(self.generated_data),
+            "artifacts": list(self.artifacts),
+            "reports": list(self.reports),
+            "site_map": dict(self.site_map),
+            "visual_results": list(self.visual_results),
             "events": list(self.events),
         }
 
@@ -131,6 +159,7 @@ class SessionContext:
         context = cls()
         for key in (
             "session_name",
+            "run_id",
             "created_at",
             "updated_at",
             "current_url",
@@ -145,6 +174,12 @@ class SessionContext:
             "last_failed_action",
             "known_feature_map",
             "known_selectors",
+            "test_plan",
+            "generated_data",
+            "artifacts",
+            "reports",
+            "site_map",
+            "visual_results",
             "events",
         ):
             if key in data:
@@ -196,16 +231,36 @@ class MainAgent:
         self.planning_agent = PlanningAgent(self.ai_client)
         self.verifier = VerifierAgent()
         self.session_store = SessionStore()
+        self.test_plan_generator = TestPlanGenerator()
+        self.reporter = ReportGenerator()
+        self.network_recorder = NetworkRecorder()
+        self.evidence = EvidenceCollector()
+        self.data_manager = TestDataManager()
+        self.visual = VisualRegression()
+        self.locator_memory = LocatorMemory()
         self.context = SessionContext()
+        self.ir_writer = IRWriter(str(Path.cwd()), self.context.run_id)
         self._running = False
         self._last_action_requested_replan = False
         self._current_task_state: Optional[TaskState] = None
+        self._current_user_task_text = ""
+        self._pending_resume: Dict[str, str] = {}
+        self._action_repeat_counts: Dict[str, int] = {}
+        self._used_recoveries: set = set()
+        self._trace_started = False
+        self._suppress_auto_plan = False
+        self._task_action_count = 0
+        self._task_consecutive_failures = 0
+        self._max_actions_per_task = 40
+        self._max_consecutive_failures = 5
+        self.network_recorder.attach(page)
 
     # ─── 对话入口 ─────────────────────────────────────────────────────────────
 
     async def run(self):
         """运行主对话循环"""
         self._running = True
+        await self._start_trace()
 
         print()
         print("=" * 60)
@@ -243,6 +298,14 @@ class MainAgent:
             if await self._handle_session_command(user_input):
                 continue
 
+            if await self._handle_engineering_command(user_input):
+                continue
+
+            if self._is_page_closed():
+                print("  浏览器页面已经关闭，本次 CLI 会话已停止。请重新进入 CLI 后继续测试。")
+                self._running = False
+                break
+
             if cmd in ("screenshot", "截图"):
                 b64 = await self.executor.get_screenshot_base64()
                 if b64:
@@ -257,6 +320,39 @@ class MainAgent:
             return input(prompt).strip()
         except (EOFError, IOError):
             return "q"
+
+    async def _start_trace(self):
+        if self._trace_started:
+            return
+        try:
+            await self.page.context.tracing.start(screenshots=True, snapshots=True, sources=True)
+            self._trace_started = True
+        except Exception:
+            self._trace_started = False
+
+    async def _save_trace_to(self, directory: Path):
+        if not self._trace_started:
+            return
+        try:
+            trace_path = directory / "trace.zip"
+            await self.page.context.tracing.stop(path=str(trace_path))
+            self._trace_started = False
+            self.context.artifacts.append(str(trace_path))
+        except Exception:
+            self._trace_started = False
+        finally:
+            await self._start_trace()
+
+    def _is_page_closed(self) -> bool:
+        try:
+            return bool(getattr(self.page, "is_closed")())
+        except Exception:
+            return False
+
+    def _reset_ir_writer(self):
+        if not getattr(self.context, "run_id", ""):
+            self.context.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.ir_writer = IRWriter(str(Path.cwd()), self.context.run_id)
 
     # ─── 命令处理 ──────────────────────────────────────────────────────────────
 
@@ -299,6 +395,11 @@ class MainAgent:
                 return True
             self.context = SessionContext.from_dict(data)
             self.context.session_name = data.get("session_name") or name
+            self._reset_ir_writer()
+            self.network_recorder.clear()
+            self._pending_resume = {}
+            self._action_repeat_counts = {}
+            self._used_recoveries = set()
             self.context.add_event("system", f"加载会话 {self.context.session_name}")
             print(f"  ✓ 已加载会话: {self.context.session_name}")
             print(f"  {self.context.to_summary()}")
@@ -309,8 +410,14 @@ class MainAgent:
         if self._starts_with_any(text, ["新建会话", "新开会话", "new session", "session new"]):
             name = self._session_name_after_command(text) or datetime.now().strftime("session-%Y%m%d-%H%M%S")
             self.context = SessionContext(session_name=name)
+            self._reset_ir_writer()
             self._current_task_state = None
+            self._current_user_task_text = ""
             self._last_action_requested_replan = False
+            self._pending_resume = {}
+            self._action_repeat_counts = {}
+            self._used_recoveries = set()
+            self.network_recorder.clear()
             print(f"  ✓ 已新建会话: {name}")
             return True
 
@@ -331,11 +438,94 @@ class MainAgent:
                 return match.group(1).strip().strip('"\'')
         return ""
 
+    async def _handle_engineering_command(self, user_input: str) -> bool:
+        """Handle testing-engineering commands that do not need model planning."""
+        text = user_input.strip()
+        lower = text.lower()
+
+        if self._looks_like_full_test_request(text):
+            await self._run_full_test_suite(text)
+            return True
+
+        if self._looks_like_all_known_feature_request(text):
+            await self._run_known_feature_suite(text)
+            return True
+
+        if any(term in lower for term in ["测试计划", "测试矩阵", "生成计划", "test plan"]):
+            await self._generate_and_show_test_plan()
+            return True
+
+        if any(term in lower for term in ["生成报告", "测试报告", "导出报告", "report"]):
+            await self._generate_report(text)
+            return True
+
+        if any(term in lower for term in ["网络日志", "接口日志", "api测试", "api 测试", "接口检查", "network"]):
+            self._show_network_report()
+            return True
+
+        if any(term in lower for term in ["测试数据", "生成数据", "造数据", "test data"]):
+            self._generate_test_data(text)
+            return True
+
+        if any(term in lower for term in ["站点地图", "功能图", "页面地图", "sitemap"]):
+            await self._generate_site_map()
+            return True
+
+        if any(term in lower for term in ["探索站点", "深度探索", "plan-explore", "plan explore", "探索页面"]):
+            await self._run_plan_explore(text)
+            return True
+
+        if any(term in lower for term in ["导出playwright", "导出 playwright", "导出用例", "export playwright", "export test"]):
+            self._export_interactive_ir(text)
+            return True
+
+        if self._starts_with_any(text, ["保存基线", "保存视觉基线", "visual baseline", "save baseline"]):
+            await self._save_visual_baseline(text)
+            return True
+
+        if self._starts_with_any(text, ["视觉对比", "视觉回归", "compare baseline", "visual compare"]):
+            await self._compare_visual_baseline(text)
+            return True
+
+        if any(term in lower for term in ["安全基础测试", "安全检查", "security audit", "security"]):
+            await self._run_security_audit(text)
+            return True
+
+        if any(term in lower for term in ["无障碍", "可访问性", "a11y", "accessibility"]):
+            await self._run_accessibility_audit(text)
+            return True
+
+        if any(term in lower for term in ["locator", "定位器记忆", "定位记忆"]):
+            self._show_locator_memory()
+            return True
+
+        if any(term in lower for term in ["agent分工", "agent 角色", "agent roles", "角色分工"]):
+            self._show_agent_roles()
+            return True
+
+        if any(term in lower for term in ["生成ci", "生成 ci", "ci配置", "github actions", "cicd", "ci/cd"]):
+            self._write_ci_template()
+            return True
+
+        if any(term in lower for term in ["回归测试", "回归执行", "regression"]):
+            await self._run_regression(text)
+            return True
+
+        return False
+
     async def _handle_user_input(self, user_input: str):
         """处理用户输入：统一交给 AI 分析意图"""
         print()
         print(f"[用户] {user_input}")
         self.context.add_event("user", user_input)
+
+        if self._looks_like_load_test_request(user_input):
+            await self._run_load_test(user_input)
+            return
+
+        if self._looks_like_quality_request(user_input):
+            await self._run_quality_audit(user_input)
+            return
 
         if self._looks_like_performance_request(user_input):
             await self._run_performance_audit(user_input)
@@ -378,8 +568,13 @@ class MainAgent:
         """Run a user task with observe-plan-act-verify-replan loop."""
         remaining_task = task
         creds_to_record = credentials
+        self._current_user_task_text = task
         self._current_task_state = TaskState.from_user_input(task)
         self.context.current_task_state = self._current_task_state.to_dict()
+        self._task_action_count = 0
+        self._task_consecutive_failures = 0
+        self._action_repeat_counts = {}
+        self._used_recoveries = set()
 
         for round_index in range(1, self.MAX_REPLAN_ROUNDS + 1):
             if round_index > 1:
@@ -549,6 +744,20 @@ class MainAgent:
                 steps.append(DelegatedStep("ExplorerAgent", f"抽取页面结构: {action.type}"))
             elif action.type == "performance_audit":
                 steps.append(DelegatedStep("PerformanceAgent", f"采集页面性能指标（{action.runs} 次）"))
+            elif action.type == "load_test":
+                steps.append(DelegatedStep("LoadTestAgent", f"压测 {action.url or '当前页面'}（{action.requests} 请求 / 并发 {action.concurrency}）"))
+            elif action.type == "quality_audit":
+                steps.append(DelegatedStep("QualityAuditAgent", "检查页面质量、无障碍和基础安全"))
+            elif action.type == "security_audit":
+                steps.append(DelegatedStep("SecurityAgent", "检查安全响应头、混合内容和危险链接"))
+            elif action.type == "accessibility_audit":
+                steps.append(DelegatedStep("AccessibilityAgent", "检查基础无障碍语义"))
+            elif action.type == "generate_test_plan":
+                steps.append(DelegatedStep("PlanningAgent", "生成测试矩阵"))
+            elif action.type == "full_test_suite":
+                steps.append(DelegatedStep("SuiteAgent", "运行一键全量测试并生成报告"))
+            elif action.type == "known_feature_suite":
+                steps.append(DelegatedStep("FeatureTestAgent", "测试当前页面已知功能入口"))
             elif action.type == "test_login":
                 steps.extend(self._build_initial_request_plan("登录", "", {}))
             elif action.type == "ask_user":
@@ -604,7 +813,7 @@ class MainAgent:
   "ask_fields": ["username", "password"],
   "actions": [
     {{
-      "type": "navigate|click|fill|assert_text|assert_visible|scroll|wait",
+      "type": "navigate|click|fill|assert_text|assert_visible|scroll|wait|full_test_suite|known_feature_suite",
       "description": "动作说明",
       "url": "导航时填写",
       "target_ref": "元素 ref，例如 e12",
@@ -624,7 +833,12 @@ class MainAgent:
 6. 如果当前页已有 ref，点击/填写必须优先使用 target_ref；多个候选看文本、placeholder、label、位置语义选择最可能的。
 7. 搜索/提交这类任务通常需要多个 actions，例如先 fill 搜索框，再 click 搜索按钮。
 8. 缺账号、密码、验证码等用户信息时，intent=ask_user 并列出 ask_fields。
-9. 只输出 JSON，不要 Markdown，不要解释。"""
+9. 如果用户要求“完整测试/全量测试/全套测试/一键测试/生成完整报告”，规划 full_test_suite；如果有 URL，先 navigate，再 full_test_suite。
+10. 如果用户要求“测试当前页面所有已知功能/所有功能/能看到的功能/全部功能”，规划 known_feature_suite；如果有 URL，先 navigate，再 known_feature_suite。
+11. 不要重复规划同一个无进展动作；如果已经在管理页还找不到写文章，要换策略为点击具体“写文章/新增/发布文章”入口，或让 ExplorerAgent 抽取链接。
+12. 对“评论/点赞/写文章”等受保护操作，如果页面提示需要登录，先规划登录，再回到原任务继续。
+13. 点击动作必须写 expected_state 思路到 description 中，例如“点击第一篇文章，预期进入 /blog/ 详情页”。
+14. 只输出 JSON，不要 Markdown，不要解释。"""
 
     def _fallback_plan(self, user_input: str) -> Optional[Dict[str, Any]]:
         """模型输出不可解析时的保底规划。"""
@@ -778,11 +992,479 @@ class MainAgent:
         lower = (text or "").lower()
         return any(term in lower for term in ["性能", "性能测试", "performance", "测速", "加载速度", "页面速度"])
 
+    def _looks_like_load_test_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        return any(term in lower for term in ["压力测试", "测试压力", "压测", "负载测试", "并发测试", "load test", "stress test"])
+
+    def _looks_like_quality_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        return any(term in lower for term in ["页面质量", "质量检查", "无障碍", "可访问性", "a11y", "seo", "基础安全", "安全检查"])
+
+    def _looks_like_full_test_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        suite_terms = [
+            "全量",
+            "完整",
+            "全套",
+            "一键",
+            "全站",
+            "everything",
+            "full",
+        ]
+        if ("测试" in lower or "test" in lower) and any(
+            term in lower for term in suite_terms
+        ):
+            return True
+        return any(term in lower for term in [
+            "全部测试",
+            "全量测试",
+            "一键测试",
+            "完整测试",
+            "全部都测试",
+            "所有都测试",
+            "跑全套",
+            "full test",
+            "full suite",
+            "test everything",
+        ])
+
+    def _looks_like_all_known_feature_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        if self._looks_like_full_test_request(text):
+            return False
+        has_test = any(term in lower for term in ["测试", "测一遍", "跑一遍", "检查", "test", "check"])
+        has_features = any(term in lower for term in [
+            "所有功能",
+            "全部功能",
+            "已知功能",
+            "页面功能",
+            "当前页面功能",
+            "能看到的功能",
+            "发现的功能",
+            "可测试功能",
+            "all functions",
+            "known functions",
+        ])
+        return has_test and has_features
+
+    async def _run_full_test_suite(self, user_input: str):
+        """Run a safe one-command full test suite and export a report."""
+        self.network_recorder.clear()
+        url = self._extract_url(user_input)
+        if url:
+            previous_auto_plan = self._suppress_auto_plan
+            self._suppress_auto_plan = True
+            try:
+                nav_result = await self._handle_navigate(url)
+            finally:
+                self._suppress_auto_plan = previous_auto_plan
+            if not nav_result or not nav_result.ok:
+                print("  全量测试停止：目标页面无法打开，后续审计不会继续使用旧页面。")
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：全量测试 http://example.com")
+            return
+
+        print("\n[一键全量测试]")
+        print("  范围: 测试计划、站点地图、质量、安全、无障碍、性能、低压压测、网络/API摘要、报告")
+        print("  安全策略: 只做 GET/HEAD 低压探测，不自动提交破坏性表单")
+
+        await self._generate_and_show_test_plan()
+        await self._generate_site_map()
+        await self._run_known_feature_suite("", from_full_suite=True)
+        await self._run_quality_audit("")
+        await self._run_security_audit("")
+        await self._run_accessibility_audit("")
+        await self._run_performance_audit("性能测试 当前页面 2次")
+
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        if current_url and current_url != "about:blank":
+            await self._run_load_test(f"压力测试 {current_url} 20次 并发2")
+
+        self._show_network_report()
+        await self._generate_report("生成报告 html")
+        await self._generate_report("生成报告 json")
+        print("  ✓ 一键全量测试完成")
+
+    async def _run_load_test(self, user_input: str):
+        """Run a bounded HTTP load test."""
+        url = self._extract_url(user_input) or self.context.current_url or getattr(self.page, "url", "")
+        if not url or url == "about:blank":
+            print("  请指定压测 URL，或先打开一个页面。例如: 压力测试 http://example.com 20次 并发2")
+            return
+
+        if self._looks_like_load_ladder_request(user_input):
+            await self._run_load_test_ladder(url)
+            return
+
+        params = self._extract_load_test_params(user_input)
+        print("\n[压力测试]")
+        print("  LoadTestAgent: 受控 HTTP 并发探测，默认低压并带硬上限")
+        print(
+            f"  目标: {url} | 请求: {params['requests']} | 并发: {params['concurrency']} | "
+            f"方法: {params['method']} | 超时: {params['timeout']}s"
+        )
+        result = await self.executor.load_test(url=url, **params)
+        if result.type != ResultType.SUCCESS:
+            print(f"  ✗ 压力测试失败: {result.reason}")
+            return
+
+        self.context.add_tested_feature("压力测试")
+        self.context.add_event("agent", result.summary, {"tool": "load_test", "url": url})
+        self._print_load_test_report(result.data)
+
+    def _looks_like_load_ladder_request(self, text: str) -> bool:
+        lower = (text or "").lower()
+        return any(term in lower for term in ["阶梯", "逐步加压", "自动加压", "持续加压", "直到失败", "ramp", "step load", "ladder"])
+
+    async def _run_load_test_ladder(self, url: str):
+        """Run controlled step-load testing and stop when the target shows stress."""
+        tiers = [
+            {"requests": 20, "concurrency": 2, "method": "GET", "timeout": 10.0, "name": "低压"},
+            {"requests": 50, "concurrency": 5, "method": "GET", "timeout": 15.0, "name": "中压"},
+            {"requests": 100, "concurrency": 10, "method": "GET", "timeout": 20.0, "name": "高压"},
+        ]
+        print("\n[阶梯压力测试]")
+        print("  LoadTestAgent: 20x2 -> 50x5 -> 100x10，错误率或 P95 过高时自动停止")
+        ladder_results = []
+        for tier in tiers:
+            name = tier.pop("name")
+            print(f"\n  [{name}] 请求 {tier['requests']} / 并发 {tier['concurrency']}")
+            result = await self.executor.load_test(url=url, **tier)
+            if result.type != ResultType.SUCCESS:
+                print(f"  ✗ {name}失败: {result.reason}")
+                self.context.add_event("agent", f"阶梯压测{name}失败: {result.reason}", {"tool": "load_test_ladder", "url": url})
+                break
+            summary = result.data.get("summary", {})
+            ladder_results.append(summary)
+            self._print_load_test_report(result.data)
+            if float(summary.get("errorRate") or 0) > 5 or float(summary.get("p95") or 0) > 5000:
+                print("  ! 已达到停止条件：错误率超过 5% 或 P95 超过 5s，停止继续加压")
+                break
+
+        self.context.add_tested_feature("阶梯压力测试")
+        self.context.add_event("agent", "阶梯压力测试完成", {
+            "tool": "load_test_ladder",
+            "url": url,
+            "tiers": ladder_results,
+        })
+
+    def _extract_load_test_params(self, text: str) -> Dict[str, Any]:
+        requests = 20
+        concurrency = 2
+        timeout = 10.0
+        method = "HEAD" if re.search(r"\bHEAD\b|head请求", text or "", re.IGNORECASE) else "GET"
+        text_lower = (text or "").lower()
+
+        if any(term in text_lower for term in ["加大力度", "加压", "更大压力", "提高压力", "中压", "medium"]):
+            requests = 50
+            concurrency = 5
+        if any(term in text_lower for term in ["高压", "强压", "极限", "拉满", "最大", "max", "high stress"]):
+            requests = 100
+            concurrency = 10
+
+        request_match = re.search(r"(\d+)\s*(?:次|个请求|请求|requests?)", text or "", re.IGNORECASE)
+        if request_match:
+            requests = int(request_match.group(1))
+        concurrency_match = re.search(r"(?:并发|concurrency|users?)\s*[:：=]?\s*(\d+)", text or "", re.IGNORECASE)
+        if not concurrency_match:
+            concurrency_match = re.search(r"(\d+)\s*(?:并发|用户)", text or "", re.IGNORECASE)
+        if concurrency_match:
+            concurrency = int(concurrency_match.group(1))
+        timeout_match = re.search(r"(?:超时|timeout)\s*[:：=]?\s*(\d+(?:\.\d+)?)", text or "", re.IGNORECASE)
+        if timeout_match:
+            timeout = float(timeout_match.group(1))
+
+        return {
+            "requests": max(1, min(requests, 100)),
+            "concurrency": max(1, min(concurrency, 10)),
+            "method": method,
+            "timeout": max(1.0, min(timeout, 30.0)),
+        }
+
+    def _print_load_test_report(self, data: Dict[str, Any]):
+        summary = data.get("summary", {})
+        print(f"  总请求: {summary.get('total', 0)}")
+        print(f"  成功/失败: {summary.get('ok', 0)} / {summary.get('failed', 0)}")
+        print(f"  错误率: {summary.get('errorRate', 0)}%")
+        print(f"  吞吐: {summary.get('rps', 0)} req/s")
+        print(
+            f"  延迟: avg {summary.get('avg', 0)} ms | "
+            f"P50 {summary.get('p50', 0)} ms | P90 {summary.get('p90', 0)} ms | "
+            f"P95 {summary.get('p95', 0)} ms | max {summary.get('max', 0)} ms"
+        )
+        print(f"  状态码: {summary.get('statusCounts', {})}")
+        errors = summary.get("errors") or {}
+        if errors:
+            print("  错误 Top:")
+            for error, count in list(errors.items())[:5]:
+                print(f"    - {count}x {error}")
+        print("  建议:")
+        for recommendation in summary.get("recommendations", []):
+            print(f"    - {recommendation}")
+
+    async def _run_known_feature_suite(self, user_input: str, from_full_suite: bool = False):
+        """Safely smoke-test every known page feature/entry without destructive submits."""
+        url = self._extract_url(user_input)
+        if url:
+            previous_auto_plan = self._suppress_auto_plan
+            self._suppress_auto_plan = True
+            try:
+                nav_result = await self._handle_navigate(url)
+            finally:
+                self._suppress_auto_plan = previous_auto_plan
+            if not nav_result or not nav_result.ok:
+                print("  已知功能测试停止：目标页面无法打开。")
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：测试 http://example.com 所有功能")
+            return
+
+        print("\n[已知功能冒烟测试]")
+        print("  安全策略: 只打开入口、检查页面状态和表单字段，不自动删除/退出/发布/付款")
+
+        original_url = self.context.current_url or getattr(self.page, "url", "")
+        snapshot = await self.executor.get_snapshot()
+        if snapshot.type == ResultType.SUCCESS:
+            self._remember_page_features(snapshot.data)
+
+        site_map = await build_site_map(self.page, max_links=80)
+        self.context.site_map = site_map
+        candidates = self._known_feature_candidates(site_map)
+        if not candidates:
+            print("  暂时没有发现可安全冒烟测试的功能入口")
+            return
+
+        results = []
+        for candidate in candidates[:12]:
+            result = await self._smoke_test_feature_candidate(candidate)
+            results.append(result)
+
+        await self._smoke_test_search_entry(results)
+        await self._smoke_test_login_entry(results)
+
+        current_url = getattr(self.page, "url", "")
+        if original_url and current_url != original_url:
+            try:
+                await self.executor.navigate(original_url)
+                self.context.add_page(original_url)
+            except Exception:
+                pass
+
+        passed = sum(1 for item in results if item.get("ok"))
+        failed = len(results) - passed
+        self.context.add_tested_feature("已知功能冒烟测试")
+        self.context.add_event("agent", "已知功能冒烟测试完成", {
+            "result_type": "success" if failed == 0 else "partial",
+            "passed": passed,
+            "failed": failed,
+            "results": results,
+        })
+        print(f"  ✓ 已知功能冒烟测试完成: 通过 {passed} / 失败 {failed}")
+        if (user_input or "").lower().find("报告") >= 0 and not from_full_suite:
+            await self._generate_report("生成报告 html")
+
+    def _known_feature_candidates(self, site_map: Dict[str, Any]) -> List[Dict[str, str]]:
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        host = urlparse(current_url or "").netloc or "unknown"
+        candidates: List[Dict[str, str]] = []
+        seen = set()
+
+        host_map = self.context.known_feature_map.get(host, {})
+        for feature, item in host_map.items():
+            if not isinstance(item, dict):
+                continue
+            href = item.get("href", "")
+            label = item.get("label") or feature
+            self._append_feature_candidate(candidates, seen, label, href, feature)
+
+        for node in site_map.get("nodes") or site_map.get("links") or []:
+            if not node.get("same_origin", True):
+                continue
+            label = node.get("text") or "(无文本入口)"
+            href = node.get("href", "")
+            feature = self._classify_feature_label(label, href)
+            self._append_feature_candidate(candidates, seen, label, href, feature)
+
+        candidates.sort(key=lambda item: self._feature_priority(item.get("feature", ""), item.get("label", ""), item.get("href", "")))
+        return candidates
+
+    def _append_feature_candidate(self, candidates: List[Dict[str, str]], seen: set, label: str, href: str, feature: str) -> None:
+        if href.startswith("/"):
+            href = self._join_origin(self.context.current_url or getattr(self.page, "url", ""), href)
+        if not href or self._is_unsafe_feature_href(label, href):
+            return
+        key = href.split("#")[0]
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append({"label": label[:80], "href": href, "feature": feature})
+
+    def _classify_feature_label(self, label: str, href: str) -> str:
+        blob = f"{label} {href}".lower()
+        if any(term in blob for term in ["搜索", "search", "查询"]):
+            return "search"
+        if any(term in blob for term in ["登录", "login", "sign in", "signin"]):
+            return "login"
+        if any(term in blob for term in ["写文章", "发文章", "write", "new post"]):
+            return "write_article"
+        if any(term in blob for term in ["评论", "留言", "guestbook", "comment"]):
+            return "comment"
+        if any(term in blob for term in ["博客", "文章", "blog", "post"]):
+            return "article_list"
+        if any(term in blob for term in ["管理", "后台", "dashboard", "admin"]):
+            return "admin"
+        return "navigation"
+
+    def _feature_priority(self, feature: str, label: str, href: str) -> int:
+        order = {
+            "search": 0,
+            "article_list": 1,
+            "login": 2,
+            "comment": 3,
+            "write_article": 4,
+            "admin": 5,
+            "navigation": 9,
+        }
+        return order.get(feature, 9)
+
+    def _is_unsafe_feature_href(self, label: str, href: str) -> bool:
+        blob = f"{label} {href}".lower()
+        unsafe_terms = [
+            "logout",
+            "退出",
+            "注销",
+            "delete",
+            "remove",
+            "删除",
+            "支付",
+            "付款",
+            "pay",
+            "order",
+            "下单",
+            "购买",
+            "上传",
+            "upload",
+            "javascript:",
+            "mailto:",
+        ]
+        return any(term in blob for term in unsafe_terms)
+
+    async def _smoke_test_feature_candidate(self, candidate: Dict[str, str]) -> Dict[str, Any]:
+        label = candidate.get("label") or candidate.get("feature") or candidate.get("href")
+        href = candidate.get("href", "")
+        feature = candidate.get("feature", "navigation")
+        print(f"  FeatureTestAgent: {label} -> {href}")
+        result = await self.executor.navigate(href)
+        if result.type != ResultType.SUCCESS:
+            print(f"    ✗ 打开失败: {result.reason}")
+            self.context.add_event("agent", f"功能入口失败: {label}", {"result_type": "failure", "href": href, "reason": result.reason})
+            return {"feature": feature, "label": label, "href": href, "ok": False, "reason": result.reason}
+
+        snapshot = await self.executor.get_snapshot()
+        snapshot_data = snapshot.data if snapshot.type == ResultType.SUCCESS else {}
+        broken_reason = self._page_broken_reason(snapshot_data)
+        if broken_reason:
+            print(f"    ✗ 页面异常: {broken_reason}")
+            self.context.add_event("agent", f"功能入口异常: {label}", {"result_type": "failure", "href": href, "reason": broken_reason})
+            return {"feature": feature, "label": label, "href": href, "ok": False, "reason": broken_reason}
+
+        print(f"    ✓ 可访问，标题: {snapshot_data.get('title') or result.data.get('title', '')}")
+        self.context.add_event("agent", f"功能入口通过: {label}", {"result_type": "success", "href": href, "feature": feature})
+        return {"feature": feature, "label": label, "href": href, "ok": True}
+
+    def _page_broken_reason(self, snapshot: Dict[str, Any]) -> str:
+        title = (snapshot.get("title") or "").lower()
+        text = (snapshot.get("text") or "").lower()
+        elements = snapshot.get("elements") or []
+        if "404" in title or "not found" in title:
+            return "标题显示 404/not found"
+        if any(term in text for term in ["404: this page could not be found", "page could not be found", "页面不存在"]):
+            return "页面正文显示不存在"
+        if not text.strip() and len(elements) == 0:
+            return "页面内容为空"
+        return ""
+
+    async def _smoke_test_search_entry(self, results: List[Dict[str, Any]]) -> None:
+        search_href = self._feature_href("search")
+        if not search_href:
+            return
+        print("  FeatureTestAgent: 搜索功能字段检查")
+        nav = await self.executor.navigate(search_href)
+        if not nav.ok:
+            results.append({"feature": "search", "label": "搜索", "href": search_href, "ok": False, "reason": nav.reason})
+            return
+        snapshot = await self.executor.get_snapshot()
+        elements = snapshot.data.get("elements", []) if snapshot.type == ResultType.SUCCESS else []
+        has_input = any(
+            e.get("tag") in ("input", "textarea")
+            and any(term in " ".join(str(e.get(key, "")) for key in ("placeholder", "label", "ariaLabel", "name", "id")).lower() for term in ["搜索", "search", "查询"])
+            for e in elements
+        )
+        results.append({"feature": "search", "label": "搜索字段", "href": search_href, "ok": has_input, "reason": "" if has_input else "未找到搜索输入框"})
+        print("    ✓ 搜索输入框存在" if has_input else "    ✗ 未找到搜索输入框")
+
+    async def _smoke_test_login_entry(self, results: List[Dict[str, Any]]) -> None:
+        login_href = self._feature_href("login")
+        if not login_href:
+            return
+        print("  FeatureTestAgent: 登录功能字段检查")
+        nav = await self.executor.navigate(login_href)
+        if not nav.ok:
+            results.append({"feature": "login", "label": "登录", "href": login_href, "ok": False, "reason": nav.reason})
+            return
+        auth = await self.executor.extract_auth_requirements()
+        fields = auth.data.get("required_fields", []) if auth.ok else []
+        ok = bool(fields)
+        results.append({"feature": "login", "label": "登录字段", "href": login_href, "ok": ok, "fields": fields, "reason": "" if ok else "未识别登录字段"})
+        print(f"    ✓ 登录字段: {', '.join(fields)}" if ok else "    ✗ 未识别登录字段")
+
+    async def _run_quality_audit(self, user_input: str):
+        """Run page quality/a11y/basic safety audit."""
+        url = self._extract_url(user_input)
+        if url:
+            nav_result = await self._handle_navigate(url)
+            if not nav_result or not nav_result.ok:
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：页面质量检查 http://example.com")
+            return
+
+        print("\n[页面质量检查]")
+        print("  QualityAuditAgent: 检查无障碍、基础 SEO、链接和表单安全")
+        result = await self.executor.quality_audit()
+        if result.type != ResultType.SUCCESS:
+            print(f"  ✗ 页面质量检查失败: {result.reason}")
+            return
+
+        self.context.add_tested_feature("页面质量检查")
+        self.context.add_event("agent", result.summary, {"tool": "quality_audit"})
+        self._print_quality_report(result.data)
+
+    def _print_quality_report(self, data: Dict[str, Any]):
+        summary = data.get("summary", {})
+        raw = data.get("raw", {})
+        print(f"  评分: {summary.get('score', 0)}/100")
+        print(f"  Title: {raw.get('title') or '(缺失)'}")
+        print(f"  lang: {raw.get('lang') or '(缺失)'} | viewport: {'有' if raw.get('hasViewport') else '缺失'}")
+        issues = summary.get("issues") or []
+        if issues:
+            print("  问题:")
+            for issue in issues[:12]:
+                print(f"    - {issue}")
+        else:
+            print("  未发现基础质量问题")
+        print("  建议:")
+        for recommendation in summary.get("recommendations", []):
+            print(f"    - {recommendation}")
+
     async def _run_performance_audit(self, user_input: str):
         """Run a deterministic performance audit tool."""
         url = self._extract_url(user_input)
         if url:
-            await self._handle_navigate(url)
+            nav_result = await self._handle_navigate(url)
+            if not nav_result or not nav_result.ok:
+                return
         elif not self._has_open_page():
             print("  请先打开一个页面，或直接说：性能测试 http://example.com")
             return
@@ -845,6 +1527,440 @@ class MainAgent:
             size /= 1024
         return f"{size:.1f} GB"
 
+    async def _generate_and_show_test_plan(self, auto: bool = False):
+        if not self._has_open_page():
+            print("  请先打开一个网站，再生成测试计划。")
+            return
+        snapshot = await self.executor.get_snapshot()
+        if snapshot.type != ResultType.SUCCESS:
+            print(f"  ✗ 无法获取页面快照: {snapshot.reason}")
+            return
+        source = "AI"
+        plan = await self._generate_ai_test_plan(snapshot.data)
+        if not plan:
+            source = "页面结构规则"
+            plan = [item.to_dict() for item in self.test_plan_generator.generate(snapshot.data)]
+        self.context.test_plan = plan
+        self.context.add_event("agent", "生成测试计划", {"items": len(plan), "source": source})
+        title = "[自动测试计划]" if auto else "[测试计划]"
+        print(f"\n{title} ({source})")
+        print("  功能点 | 前置条件 | 步骤 | 预期结果 | 风险 | 需登录")
+        for index, item in enumerate(plan, 1):
+            steps = " -> ".join(item.get("steps") or [])
+            print(
+                f"  {index}. {item.get('feature')} | {item.get('precondition')} | "
+                f"{steps} | {item.get('expected')} | {item.get('risk')} | "
+                f"{'是' if item.get('needs_login') else '否'}"
+            )
+
+    async def _generate_ai_test_plan(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Ask the model for a site-specific test matrix. Falls back on failure."""
+        prompt = f"""你是资深软件测试工程师。请基于当前页面快照，为这个具体网站生成测试矩阵。
+
+要求:
+1. 不要输出通用模板，要结合页面标题、URL、文本和元素判断业务类型。
+2. 每条用例必须包含: feature, precondition, steps, expected, risk, needs_login。
+3. risk 只能是: 高/中/低。
+4. steps 是字符串数组，3-6 步。
+5. 只输出 JSON，不要 Markdown。
+
+当前页面快照:
+{self._format_snapshot_for_test_plan(snapshot)}
+
+输出 JSON schema:
+{{
+  "items": [
+    {{
+      "feature": "功能点名称",
+      "precondition": "前置条件",
+      "steps": ["步骤1", "步骤2", "步骤3"],
+      "expected": "预期结果",
+      "risk": "高",
+      "needs_login": false
+    }}
+  ]
+}}
+"""
+        try:
+            response = await self.ai_client.complete(prompt, "")
+            payload = extract_json_payload(response)
+            return self._normalize_test_plan_items((payload or {}).get("items", []))
+        except Exception:
+            return []
+
+    def _format_snapshot_for_test_plan(self, snapshot: Dict[str, Any]) -> str:
+        elements = snapshot.get("elements") or []
+        lines = [
+            f"URL: {snapshot.get('url', '')}",
+            f"标题: {snapshot.get('title', '')}",
+            f"可见文本摘要: {(snapshot.get('text') or '')[:1200]}",
+            "可交互元素:",
+        ]
+        for element in elements[:60]:
+            bits = [
+                f"- {element.get('ref', '')} <{element.get('tag', '')}>",
+                f"text='{(element.get('text') or '')[:80]}'",
+            ]
+            for key in ("placeholder", "label", "ariaLabel", "href", "type", "role"):
+                value = element.get(key)
+                if value:
+                    bits.append(f"{key}='{str(value)[:100]}'")
+            lines.append(" ".join(bits))
+        return "\n".join(lines)
+
+    def _normalize_test_plan_items(self, items: Any) -> List[Dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        normalized = []
+        for item in items[:12]:
+            if not isinstance(item, dict):
+                continue
+            feature = str(item.get("feature") or item.get("功能点") or "").strip()
+            if not feature:
+                continue
+            steps = item.get("steps") or item.get("测试步骤") or []
+            if isinstance(steps, str):
+                steps = [part.strip() for part in re.split(r"->|;|；|\n", steps) if part.strip()]
+            if not isinstance(steps, list):
+                steps = []
+            risk = str(item.get("risk") or item.get("风险") or "中").strip()
+            if risk not in {"高", "中", "低"}:
+                risk = "中"
+            needs_login = item.get("needs_login", item.get("是否需要登录", False))
+            if isinstance(needs_login, str):
+                needs_login = needs_login.strip().lower() in {"true", "yes", "y", "1", "是", "需要"}
+            normalized.append({
+                "feature": feature,
+                "precondition": str(item.get("precondition") or item.get("前置条件") or "已打开目标页面").strip(),
+                "steps": [str(step).strip() for step in steps if str(step).strip()][:6],
+                "expected": str(item.get("expected") or item.get("预期结果") or "功能表现符合预期").strip(),
+                "risk": risk,
+                "needs_login": bool(needs_login),
+            })
+        return normalized
+
+    async def _generate_report(self, text: str):
+        fmt = "markdown"
+        for candidate in ("html", "json", "junit", "markdown", "md"):
+            if re.search(rf"\b{candidate}\b", text, re.IGNORECASE):
+                fmt = candidate
+                break
+        context_data = self.context.to_dict(redact=True)
+        context_data["network"] = self.network_recorder.summary()
+        if "all" in text.lower() or "全部" in text:
+            paths = []
+            for item in ("markdown", "html", "json", "junit"):
+                paths.append(self.reporter.write(context_data, item, self.context.session_name))
+            self.context.reports.extend(str(path) for path in paths)
+            print("  ✓ 已生成全部报告:")
+            for path in paths:
+                print(f"    - {path}")
+            return
+        path = self.reporter.write(context_data, fmt, self.context.session_name)
+        self.context.reports.append(str(path))
+        self.context.add_event("agent", f"生成报告 {fmt}", {"path": str(path)})
+        print(f"  ✓ 报告已生成: {path}")
+
+    def _show_network_report(self):
+        summary = self.network_recorder.summary()
+        self.context.add_event("agent", "查看网络/API日志", summary)
+        print("\n[网络/API 检查]")
+        print(f"  请求总数: {summary['total']} | API-like: {summary['api_like']} | 失败: {summary['failed']}")
+        print(f"  状态码: {summary['status_counts']}")
+        if summary["slow"]:
+            print("  慢请求 Top:")
+            for record in summary["slow"][:8]:
+                print(f"    - {record.get('duration')} ms | {record.get('status')} | {record.get('method')} {record.get('url')}")
+        if summary["recent_api"]:
+            print("  最近接口:")
+            for record in summary["recent_api"][-8:]:
+                print(f"    - {record.get('status')} | {record.get('duration')} ms | {record.get('url')}")
+
+    def _generate_test_data(self, text: str):
+        kind = "comment"
+        if any(term in text for term in ["用户", "账号", "username", "user"]):
+            kind = "user"
+        elif any(term in text for term in ["邮箱", "email"]):
+            kind = "email"
+        elif any(term in text for term in ["文章", "article"]):
+            kind = "article"
+        data = self.data_manager.generate(kind)
+        self.context.generated_data.append(data)
+        self.context.add_event("agent", f"生成测试数据 {kind}", data)
+        print("\n[测试数据]")
+        for key, value in data.items():
+            print(f"  {key}: {value}")
+
+    async def _generate_site_map(self):
+        if not self._has_open_page():
+            print("  请先打开一个页面，再生成站点地图。")
+            return
+        site_map = await build_site_map(self.page)
+        self.context.site_map = site_map
+        self.context.add_event("agent", "生成站点地图", {"total": site_map.get("total", 0)})
+        print("\n[站点地图]")
+        print(f"  Root: {site_map.get('root')}")
+        for node in site_map.get("nodes", [])[:30]:
+            marker = "站内" if node.get("same_origin") else "站外"
+            print(f"  - [{marker}] {node.get('text') or '(无文本)'} -> {node.get('href')}")
+
+    async def _run_plan_explore(self, text: str):
+        url = self._extract_url(text)
+        if url:
+            nav_result = await self._handle_navigate(url)
+            if not nav_result or not nav_result.ok:
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：探索站点 http://example.com 深度2 页面20")
+            return
+
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        depth, max_pages, mode, include_patterns, exclude_patterns = self._parse_explore_options(text, current_url)
+        scope = UrlScope(
+            base_url=current_url,
+            mode=mode,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+
+        print("\n[站点深度探索]")
+        print(f"  ExploreAgent: URL Scope={scope.mode} | 深度={depth} | 页面上限={max_pages}")
+        if scope.include_patterns:
+            print(f"  Include: {', '.join(scope.include_patterns)}")
+        if scope.exclude_patterns:
+            print(f"  Exclude: {', '.join(scope.exclude_patterns)}")
+
+        result = await explore_site_map(self.page, scope=scope, max_depth=depth, max_pages=max_pages)
+        artifact_dir = write_exploration_artifacts(result, self.context.session_name)
+        self.context.site_map = result.get("graph", {})
+        self.context.artifacts.append(str(artifact_dir))
+        self.context.add_event("agent", "站点深度探索", {"stats": result.get("stats", {}), "artifactDir": str(artifact_dir)})
+
+        stats = result.get("stats", {})
+        print(f"  页面: {stats.get('pagesVisited', 0)} | 链接: {stats.get('linksFound', 0)} | 表单: {stats.get('formsFound', 0)} | 元素: {stats.get('elementsFound', 0)}")
+        print(f"  最大深度: {stats.get('maxDepthReached', 0)}")
+        print(f"  ✓ 探索产物已保存: {artifact_dir}")
+        for page_node in result.get("graph", {}).get("pages", [])[:10]:
+            print(f"  - d{page_node.get('depth', 0)} {page_node.get('title') or '(无标题)'} -> {page_node.get('url')}")
+
+    def _parse_explore_options(self, text: str, current_url: str):
+        depth = 2
+        max_pages = 20
+        mode = "site"
+
+        depth_match = re.search(r"(?:深度|depth)\s*[:：=]?\s*(\d+)", text, re.I)
+        if depth_match:
+            depth = int(depth_match.group(1))
+
+        page_match = re.search(r"(?:页面|pages?|max-pages|max pages)\s*[:：=]?\s*(\d+)", text, re.I)
+        if page_match:
+            max_pages = int(page_match.group(1))
+
+        lower = text.lower()
+        if "single_page" in lower or "single-page" in lower or "单页" in lower:
+            mode = "single_page"
+        elif "focused" in lower or "聚焦" in lower:
+            mode = "focused"
+
+        include_patterns = self._extract_scope_patterns(text, ["include", "包含", "白名单"])
+        exclude_patterns = self._extract_scope_patterns(text, ["exclude", "排除", "黑名单"])
+
+        if mode in {"focused", "single_page"} and not include_patterns:
+            parsed = urlparse(current_url)
+            relative = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "") + (f"#{parsed.fragment}" if parsed.fragment else "")
+            include_patterns = [relative.rstrip("*") + "*"]
+
+        return max(0, min(depth, 5)), max(1, min(max_pages, 100)), mode, include_patterns, exclude_patterns
+
+    def _extract_scope_patterns(self, text: str, keys: List[str]) -> List[str]:
+        patterns: List[str] = []
+        for key in keys:
+            for match in re.finditer(rf"{re.escape(key)}\s*[:：=]\s*([^\s]+)", text, re.I):
+                raw = match.group(1).strip().strip('"\'')
+                patterns.extend([part.strip() for part in raw.split(",") if part.strip()])
+        return patterns[:20]
+
+    def _export_interactive_ir(self, text: str):
+        from ..runner.exporter import export_from_ir
+
+        export_dir = "tests/testforge"
+        dir_match = re.search(r"(?:到|to|dir|目录)\s*[:：=]?\s*([^\s]+)", text, re.I)
+        if dir_match:
+            export_dir = dir_match.group(1).strip().strip('"\'')
+
+        result = export_from_ir(
+            cwd=str(Path.cwd()),
+            run_id=self.context.run_id,
+            spec_path="interactive",
+            export_dir=export_dir,
+            base_url=self._infer_base_url(),
+        )
+        if result.get("ok"):
+            self.context.artifacts.append(result["path"])
+            self.context.add_event("agent", "导出 Playwright 用例", {"path": result["path"]})
+            print(f"  ✓ 已导出 Playwright 用例: {result['path']}")
+        else:
+            print(f"  ✗ 导出失败: {result.get('message')}")
+            print(f"  IR 路径: {self.ir_writer.path}")
+
+    async def _save_visual_baseline(self, text: str):
+        if not self._has_open_page():
+            print("  请先打开一个页面，再保存视觉基线。")
+            return
+        name = self._name_after_visual_command(text) or self.context.session_name
+        path = await self.visual.save_baseline(self.page, name)
+        self.context.visual_results.append({"action": "baseline", "name": name, "path": str(path)})
+        self.context.add_event("agent", f"保存视觉基线 {name}", {"path": str(path)})
+        print(f"  ✓ 视觉基线已保存: {path}")
+
+    async def _compare_visual_baseline(self, text: str):
+        if not self._has_open_page():
+            print("  请先打开一个页面，再做视觉对比。")
+            return
+        name = self._name_after_visual_command(text) or self.context.session_name
+        try:
+            result = await self.visual.compare(self.page, name)
+        except FileNotFoundError as e:
+            print(f"  ✗ {e}")
+            return
+        self.context.visual_results.append(result)
+        self.context.add_event("agent", f"视觉回归对比 {name}", result)
+        print("\n[视觉回归]")
+        print(f"  基线: {result.get('baseline')}")
+        print(f"  当前: {result.get('current')}")
+        print(f"  差异: {result.get('diff_percent')}% | {'通过' if result.get('passed') else '不通过'}")
+
+    def _name_after_visual_command(self, text: str) -> str:
+        cleaned = re.sub(r"^(保存基线|保存视觉基线|视觉对比|视觉回归|visual baseline|save baseline|compare baseline|visual compare)\s*[:：]?", "", text.strip(), flags=re.I)
+        return cleaned.strip().strip('"\'')
+
+    async def _run_security_audit(self, text: str):
+        url = self._extract_url(text)
+        if url:
+            nav_result = await self._handle_navigate(url)
+            if not nav_result or not nav_result.ok:
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：安全检查 http://example.com")
+            return
+        print("\n[安全基础测试]")
+        result = await self.executor.security_audit()
+        if not result.ok:
+            print(f"  ✗ 安全检查失败: {result.reason}")
+            return
+        self.context.add_tested_feature("安全基础测试")
+        self.context.add_event("agent", result.summary, {"tool": "security_audit"})
+        self._print_audit_summary(result.data)
+
+    async def _run_accessibility_audit(self, text: str):
+        url = self._extract_url(text)
+        if url:
+            nav_result = await self._handle_navigate(url)
+            if not nav_result or not nav_result.ok:
+                return
+        elif not self._has_open_page():
+            print("  请先打开一个页面，或直接说：无障碍检查 http://example.com")
+            return
+        print("\n[无障碍检查]")
+        result = await self.executor.accessibility_audit()
+        if not result.ok:
+            print(f"  ✗ 无障碍检查失败: {result.reason}")
+            return
+        self.context.add_tested_feature("无障碍检查")
+        self.context.add_event("agent", result.summary, {"tool": "accessibility_audit"})
+        self._print_audit_summary(result.data)
+
+    def _print_audit_summary(self, data: Dict[str, Any]):
+        summary = data.get("summary", {})
+        print(f"  评分: {summary.get('score', 0)}/100")
+        issues = summary.get("issues") or []
+        if issues:
+            print("  问题:")
+            for issue in issues[:12]:
+                print(f"    - {issue}")
+        else:
+            print("  未发现基础问题")
+        print("  建议:")
+        for recommendation in summary.get("recommendations", []):
+            print(f"    - {recommendation}")
+
+    def _show_locator_memory(self):
+        host = urlparse(self.context.current_url or getattr(self.page, "url", "") or "").netloc or "unknown"
+        data = self.locator_memory.data.get(host, {})
+        print(f"\n[Locator 学习] {host}")
+        if not data:
+            print("  暂无成功定位记录")
+            return
+        for key, value in list(data.items())[:20]:
+            print(f"  - {value.get('description')}: <{value.get('tag')}> {value.get('text') or value.get('href')}")
+
+    def _show_agent_roles(self):
+        roles = [
+            ("MainAgent", "对话、上下文、任务协调"),
+            ("PlanningAgent", "理解用户需求并拆分步骤"),
+            ("ExplorerAgent", "抽取页面结构、表单、文章、搜索结果、登录要求"),
+            ("BrowserAgent", "执行点击、填写、导航、滚动、等待"),
+            ("VerifierAgent", "验证动作结果和高层任务是否完成"),
+            ("DataAgent", "生成测试数据并记录清理线索"),
+            ("ReporterAgent", "生成 Markdown/HTML/JSON/JUnit 报告"),
+            ("SecurityAgent", "低风险安全响应头/表单/混合内容检查"),
+            ("LoadTestAgent", "受控 HTTP 压测"),
+            ("RegressionAgent", "加载历史会话并重跑用户任务"),
+        ]
+        print("\n[Agent 分工]")
+        for name, task in roles:
+            print(f"  - {name}: {task}")
+
+    def _write_ci_template(self):
+        path = Path.cwd() / ".github" / "workflows" / "testforge.yml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = """name: TestForge
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  testforge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt || pip install playwright Pillow httpx pytest
+      - run: python -m playwright install chromium
+      - run: python -m pytest tests/unit/ -q
+      # Example future regression entry:
+      # - run: python run_cli.py --session blog-test --report html
+"""
+        path.write_text(content, encoding="utf-8")
+        self.context.add_event("agent", "生成 CI 配置", {"path": str(path)})
+        print(f"  ✓ CI 配置已生成: {path}")
+
+    async def _run_regression(self, text: str):
+        name = re.sub(r"^(回归测试|回归执行|regression)\s*[:：]?", "", text.strip(), flags=re.I).strip()
+        if not name:
+            name = self.context.session_name
+        try:
+            data = self.session_store.load(name)
+        except FileNotFoundError as e:
+            print(f"  ✗ {e}")
+            return
+        events = [event for event in data.get("events", []) if event.get("role") == "user"]
+        if not events:
+            print("  该会话没有可回放的用户任务")
+            return
+        print(f"\n[回归测试] {name}")
+        self.context.add_event("agent", f"开始回归测试 {name}", {"steps": len(events)})
+        for index, event in enumerate(events[:20], 1):
+            task = event.get("text", "")
+            if not task or any(term in task for term in ["保存会话", "加载会话", "回归测试"]):
+                continue
+            print(f"\n  [回归 {index}] {task}")
+            await self._handle_user_input(task)
+
     def _prepare_url(self, url: str) -> str:
         """Normalize a URL coming from either user text or model output."""
         url = self._clean_url_candidate(url)
@@ -861,7 +1977,7 @@ class MainAgent:
         # Only strip root-level phrases like /这个网站的登录功能; keep legitimate
         # paths such as /blog/linux运维.
         root_phrase_match = re.match(
-            r"^(https?://[^/\s?#]+)/(这个网站|这个页面|这个网页|这个地址|该网站|该页面|此网站|此页面)(?:的.*)?$",
+            r"^(https?://[^/\s?#]+)/(这个网站|这个页面|这个网页|这个地址|该网站|该页面|此网站|此页面)(?:的.*|.*(?:测试|报告|检查|分析|压测|性能|质量|安全).*)?$",
             url,
             re.IGNORECASE,
         )
@@ -1082,9 +2198,13 @@ class MainAgent:
 
             # 分析页面
             await self._analyze_and_report_page()
+            if not self._suppress_auto_plan:
+                await self._generate_and_show_test_plan(auto=True)
 
         else:
             print(f"  ✗ 导航失败: {result.reason}")
+
+        return result
 
     # ─── 页面分析 ─────────────────────────────────────────────────────────────
 
@@ -1100,6 +2220,7 @@ class MainAgent:
             print("  页面元素为空，可能还在加载")
             return
 
+        self._remember_page_features(snapshot_result.data)
         print(f"\n  页面元素: {len(elements)} 个")
 
         # AI 分析页面功能
@@ -1195,6 +2316,7 @@ class MainAgent:
             self.context.is_logged_in = True
             self.context.logged_in_user = self.context.credentials.get("username")
             await self._after_login_success()
+            await self._resume_after_login_if_needed()
             return
 
         if login_detect.type == ResultType.FAILURE:
@@ -1226,10 +2348,11 @@ class MainAgent:
                 password = getpass.getpass("  密码: ").strip()
 
             if not username or not password:
-                print("  ✗ 需要用户名和密码")
+                print("  ✗ 登录测试暂停：缺少用户名或密码，我不会提交空凭证。")
                 # 保存凭证供下次使用
                 if username:
                     self.context.set_credentials(username=username)
+                print("  你可以直接说：账号是admin 密码是xxxx")
                 return
 
             # 保存凭证
@@ -1245,6 +2368,7 @@ class MainAgent:
                 self.context.logged_in_user = username
                 self.context.add_tested_feature("登录")
                 await self._after_login_success()
+                await self._resume_after_login_if_needed()
             else:
                 print(f"  ✗ 登录失败: {login_result.reason}")
                 print("  请检查用户名和密码是否正确")
@@ -1383,10 +2507,19 @@ class MainAgent:
 
         if normalized.actions:
             for action in normalized.actions:
+                self._task_action_count += 1
+                guardrail = self._check_task_guardrails()
+                if guardrail:
+                    print(f"  ✗ Guardrail 触发: {guardrail}")
+                    await self._capture_failure_evidence(guardrail)
+                    return False
                 before = await self.executor.get_snapshot()
                 result = await self._execute_action(action)
                 if result is not None:
+                    self._annotate_result_semantics(action, result)
+                    self._record_action_ir(action, result)
                     await self._handle_executor_result(result)
+                    self._task_consecutive_failures = 0 if result.ok else self._task_consecutive_failures + 1
                     after = await self.executor.get_snapshot()
                     if before.type == ResultType.SUCCESS and after.type == ResultType.SUCCESS:
                         verification = self.verifier.verify_action(action, before.data, after.data)
@@ -1394,7 +2527,13 @@ class MainAgent:
                             print(f"  ! 动作验证未通过: {verification.reason}")
                             if verification.suggestion:
                                 print(f"  建议: {verification.suggestion}")
-                            if verification.needs_replan:
+                            recovered = await self._recover_failed_verification(action, verification)
+                            if recovered is not None:
+                                result = recovered
+                                self._record_action_ir(action, result)
+                                await self._handle_executor_result(result)
+                                self._task_consecutive_failures = 0 if result.ok else self._task_consecutive_failures + 1
+                            elif verification.needs_replan:
                                 result.data["needs_replan"] = True
                     if result.data.get("needs_replan"):
                         self._last_action_requested_replan = True
@@ -1413,19 +2552,36 @@ class MainAgent:
 
     async def _execute_action(self, action: AgentAction) -> Optional[ExecutorResult]:
         """执行单个 AgentAction。"""
+        if self._is_page_closed():
+            self._running = False
+            return ExecutorResult(type=ResultType.FAILURE, reason="浏览器页面已经关闭，无法继续执行当前任务")
+
         action_type = action.type
+        repeated = await self._maybe_recover_repeated_action(action)
+        if repeated is not None:
+            return repeated
 
         if action_type == "navigate":
             if not action.url:
                 return ExecutorResult(type=ResultType.FAILURE, reason="未提供 URL")
-            await self._handle_navigate(action.url)
+            result = await self._handle_navigate(action.url)
+            if result:
+                self._record_action_ir(action, result)
+            if result and not result.ok:
+                return result
             return None
 
         if action_type == "click":
-            return await self.executor.click(
+            guarded = await self._guard_risky_click(action)
+            if guarded is not None:
+                return guarded
+            result = await self.executor.click(
                 ref=action.target_ref,
                 description=action.target_desc or action.description,
             )
+            if result.ok:
+                self._record_locator_success(action)
+            return result
 
         if action_type == "fill":
             text = action.fill_value or action.text
@@ -1439,6 +2595,12 @@ class MainAgent:
             )
             if result.type == ResultType.FAILURE and self._action_looks_like_search_fill(action):
                 return await self._recover_missing_search_input(action)
+            if result.type == ResultType.FAILURE and self._action_looks_like_protected_input(action):
+                recovered = await self._recover_auth_required_action(action)
+                if recovered:
+                    return recovered
+            if result.ok:
+                self._record_locator_success(action)
             return result
 
         if action_type == "assert_text":
@@ -1460,6 +2622,12 @@ class MainAgent:
         if action_type == "analyze":
             await self._analyze_and_report_page()
             return None
+
+        if action_type == "extract_links":
+            result = await self.executor.extract_links()
+            if result.ok:
+                print(f"  ✓ 已提取链接: {result.data.get('total', 0)} 条")
+            return result
 
         if action_type == "extract_search_results":
             result = await self.executor.extract_search_results()
@@ -1505,6 +2673,53 @@ class MainAgent:
                 self._print_performance_report(result.data)
             return result
 
+        if action_type == "load_test":
+            target = action.url or self.context.current_url or getattr(self.page, "url", "")
+            result = await self.executor.load_test(
+                url=target,
+                requests=action.requests,
+                concurrency=action.concurrency,
+                method=action.method,
+                timeout=action.timeout,
+            )
+            if result.ok:
+                self.context.add_tested_feature("压力测试")
+                self._print_load_test_report(result.data)
+            return result
+
+        if action_type == "quality_audit":
+            result = await self.executor.quality_audit()
+            if result.ok:
+                self.context.add_tested_feature("页面质量检查")
+                self._print_quality_report(result.data)
+            return result
+
+        if action_type == "security_audit":
+            result = await self.executor.security_audit()
+            if result.ok:
+                self.context.add_tested_feature("安全基础测试")
+                self._print_audit_summary(result.data)
+            return result
+
+        if action_type == "accessibility_audit":
+            result = await self.executor.accessibility_audit()
+            if result.ok:
+                self.context.add_tested_feature("无障碍检查")
+                self._print_audit_summary(result.data)
+            return result
+
+        if action_type == "generate_test_plan":
+            await self._generate_and_show_test_plan()
+            return None
+
+        if action_type == "full_test_suite":
+            await self._run_full_test_suite(action.url or "")
+            return ExecutorResult(type=ResultType.DONE, summary="已完成一键全量测试")
+
+        if action_type == "known_feature_suite":
+            await self._run_known_feature_suite("")
+            return ExecutorResult(type=ResultType.DONE, summary="已完成已知功能冒烟测试")
+
         if action_type == "test_login":
             await self._handle_test_task("测试登录")
             return None
@@ -1519,6 +2734,311 @@ class MainAgent:
 
         return ExecutorResult(type=ResultType.FAILURE, reason=f"未知动作: {action_type}")
 
+    async def _recover_failed_verification(self, action: AgentAction, verification) -> Optional[ExecutorResult]:
+        """Execute a concrete self-healing path when VerifierAgent knows the fix."""
+        hint = f"{verification.reason} {verification.suggestion}".lower()
+        should_open_article = (
+            "extract_search_results" in hint
+            or "文章详情" in hint
+            or ("article" in hint and self._task_needs_open_article())
+        )
+        if not should_open_article:
+            if any(term in hint for term in ["登录", "login", "auth", "sign in"]):
+                return await self._recover_auth_required_action(action)
+            return None
+
+        print("  VerifierAgent: 改用结构化搜索结果链接恢复...")
+        result = await self.executor.extract_search_results()
+        if not result.ok:
+            return None
+        print(f"  ✓ 已提取搜索结果: {result.data.get('total', 0)} 条")
+        return await self._open_first_extracted_search_result(result)
+
+    async def _guard_risky_click(self, action: AgentAction) -> Optional[ExecutorResult]:
+        """Prevent accidental destructive actions during exploratory testing."""
+        if not self._is_publish_click(action):
+            return None
+
+        current_url = (self.context.current_url or getattr(self.page, "url", "") or "").lower()
+        if not any(path in current_url for path in ["/dashboard/write", "/write", "/editor"]):
+            return None
+
+        if self._current_task_confirms_real_publish():
+            return None
+
+        return ExecutorResult(
+            type=ResultType.DONE,
+            data={"publish_blocked": True},
+            summary="已完成写文章发布前流程验证；为避免创建真实内容，已拦截“发布”动作。若要真正发布，请明确说“确认发布测试文章”。",
+        )
+
+    def _is_publish_click(self, action: AgentAction) -> bool:
+        if action.type != "click":
+            return False
+        text = " ".join([
+            action.description,
+            action.target_desc,
+            action.target_ref,
+            action.text,
+            action.expected,
+        ]).lower()
+        return any(term in text for term in ["发布", "提交", "提交文章", "publish", "submit post", "post article"])
+
+    def _current_task_confirms_real_publish(self) -> bool:
+        text = (getattr(self, "_current_user_task_text", "") or "").lower()
+        return any(term in text for term in [
+            "确认发布",
+            "真的发布",
+            "可以发布",
+            "允许发布",
+            "直接发布测试文章",
+            "publish for real",
+            "confirm publish",
+        ])
+
+    async def _maybe_recover_repeated_action(self, action: AgentAction) -> Optional[ExecutorResult]:
+        """Detect loops like clicking the same dashboard card forever and switch strategy."""
+        if action.type not in {"click", "fill", "navigate"}:
+            return None
+
+        signature = self._action_signature(action)
+        counts = getattr(self, "_action_repeat_counts", {})
+        counts[signature] = counts.get(signature, 0) + 1
+        self._action_repeat_counts = counts
+        if counts[signature] < 3:
+            return None
+
+        if signature in getattr(self, "_used_recoveries", set()):
+            return ExecutorResult(
+                type=ResultType.FAILURE,
+                reason=f"重复执行同一动作仍未达成目标，已停止: {signature}",
+                data={"repeat_count": counts[signature], "signature": signature},
+            )
+        self._used_recoveries.add(signature)
+
+        if self._task_has_goal("write_article"):
+            recovered = await self._recover_write_article_entry()
+            if recovered is not None:
+                return recovered
+
+        if self._task_has_goal("open_article"):
+            result = await self.executor.extract_search_results()
+            if result.ok:
+                print("  重复动作检测: 改用搜索结果中的文章链接")
+                opened = await self._open_first_extracted_search_result(result)
+                if opened is not None:
+                    return opened
+
+        return ExecutorResult(
+            type=ResultType.FAILURE,
+            reason=f"检测到重复动作没有推进页面，已停止避免空转: {signature}",
+            data={"repeat_count": counts[signature], "signature": signature},
+        )
+
+    def _action_signature(self, action: AgentAction) -> str:
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        try:
+            parsed = urlparse(current_url)
+            location = f"{parsed.netloc}{parsed.path}"
+        except Exception:
+            location = current_url
+        target = action.target_ref or action.target_desc or action.description or action.url or action.type
+        return f"{action.type}|{location}|{target}".lower()
+
+    def _task_has_goal(self, goal_type: str) -> bool:
+        state = getattr(self, "_current_task_state", None)
+        return bool(state and any(goal.type == goal_type and not goal.done for goal in state.goals))
+
+    async def _recover_write_article_entry(self) -> Optional[ExecutorResult]:
+        """Use remembered or conventional editor URL when the planner loops in admin/blog pages."""
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        remembered = self._feature_href("write_article")
+        target = remembered or self._join_origin(current_url, "/dashboard/write")
+        if target.startswith("/"):
+            target = self._join_origin(current_url, target)
+        if not target:
+            return None
+
+        print("  重复动作检测: 直接尝试进入写文章编辑页")
+        nav_result = await self.executor.navigate(target)
+        if nav_result.ok:
+            self.context.add_page(nav_result.data.get("url", target), nav_result.data.get("title", ""))
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data={"url": nav_result.data.get("url", target), "recovered_by": "write_article_direct_url"},
+                summary=f"已切换到写文章入口: {nav_result.data.get('url', target)}",
+            )
+        return nav_result
+
+    def _feature_href(self, feature: str) -> str:
+        current_url = self.context.current_url or getattr(self.page, "url", "")
+        host = urlparse(current_url or "").netloc or "unknown"
+        host_map = self.context.known_feature_map.get(host, {})
+        item = host_map.get(feature) or {}
+        return item.get("href", "") if isinstance(item, dict) else ""
+
+    def _join_origin(self, url: str, path: str) -> str:
+        try:
+            parsed = urlparse(url or "")
+        except Exception:
+            return ""
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+    def _remember_page_features(self, snapshot: Dict[str, Any]) -> None:
+        """Keep a small site feature map so future plans can use known good paths."""
+        url = snapshot.get("url") or self.context.current_url or getattr(self.page, "url", "")
+        host = urlparse(url or "").netloc or "unknown"
+        host_map = self.context.known_feature_map.setdefault(host, {})
+        for element in snapshot.get("elements") or []:
+            href = element.get("href") or ""
+            label = " ".join(str(element.get(key, "")) for key in ("text", "placeholder", "label", "ariaLabel", "id", "name")).strip()
+            blob = f"{label} {href}".lower()
+            resolved_href = href
+            if any(term in blob for term in ["搜索", "search", "查询"]):
+                self._record_feature_candidate(host_map, "search", label, resolved_href)
+            if any(term in blob for term in ["登录", "login", "sign in", "signin", "登入", "登陆"]):
+                self._record_feature_candidate(host_map, "login", label, resolved_href)
+            if any(term in blob for term in ["写文章", "发文章", "添加文章", "新增文章", "write", "new post", "editor"]):
+                self._record_feature_candidate(host_map, "write_article", label, resolved_href)
+            if any(term in blob for term in ["评论", "留言", "comment", "guestbook"]):
+                self._record_feature_candidate(host_map, "comment", label, resolved_href)
+            if any(term in blob for term in ["管理", "后台", "dashboard", "admin"]):
+                self._record_feature_candidate(host_map, "admin", label, resolved_href)
+            if any(term in blob for term in ["博客", "文章", "blog", "post"]):
+                self._record_feature_candidate(host_map, "article_list", label, resolved_href)
+
+    def _record_feature_candidate(self, host_map: Dict[str, Any], feature: str, label: str, href: str) -> None:
+        if not href:
+            return
+        current = host_map.get(feature) or {}
+        if current.get("href"):
+            return
+        host_map[feature] = {
+            "label": label[:80],
+            "href": href,
+            "last_seen": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _check_task_guardrails(self) -> str:
+        if self._task_action_count > self._max_actions_per_task:
+            return f"单个任务动作数超过上限 {self._max_actions_per_task}，已停止以避免无限循环"
+        if self._task_consecutive_failures > self._max_consecutive_failures:
+            return f"连续失败超过上限 {self._max_consecutive_failures}，已停止并保存证据"
+        return ""
+
+    def _record_action_ir(self, action: AgentAction, result: ExecutorResult):
+        """Record interactive CLI actions as AutoQA-style IR for later export."""
+        try:
+            tool_name = self._ir_tool_name(action.type)
+            if not tool_name:
+                return
+            tool_input = self._ir_tool_input(action)
+            element = self._ir_element_record(action)
+            self.ir_writer.append_action(
+                run_id=self.context.run_id,
+                spec_path="interactive",
+                step_index=self._task_action_count or None,
+                step_text=action.description or action.target_desc or action.text or action.url or action.type,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                outcome={"ok": result.ok, "errorMessage": result.reason or ""},
+                page_url=self.context.current_url or getattr(self.page, "url", ""),
+                element=element,
+            )
+        except Exception:
+            pass
+
+    def _annotate_result_semantics(self, action: AgentAction, result: ExecutorResult) -> None:
+        """Attach testing-oriented meaning to low-level tool results."""
+        result.data.setdefault("action_type", action.type)
+        result.data.setdefault("action_ok", result.ok)
+        result.data.setdefault("goal_hint", self._goal_hint_for_action(action))
+        if result.type == ResultType.FAILURE:
+            result.data.setdefault("goal_ok", False)
+        elif result.data.get("needs_replan"):
+            result.data.setdefault("goal_ok", False)
+        else:
+            result.data.setdefault("goal_ok", True)
+
+    def _goal_hint_for_action(self, action: AgentAction) -> str:
+        text = " ".join([
+            action.description,
+            action.target_desc,
+            action.target_ref,
+            action.text,
+            action.expected,
+            action.url,
+        ]).lower()
+        if any(term in text for term in ["搜索", "search", "查询"]):
+            return "search"
+        if any(term in text for term in ["登录", "login", "sign in", "signin"]):
+            return "login"
+        if any(term in text for term in ["点赞", "赞", "like"]):
+            return "like"
+        if any(term in text for term in ["评论", "留言", "comment"]):
+            return "comment"
+        if any(term in text for term in ["写文章", "发布", "文章", "write", "post"]):
+            return "article"
+        return action.type
+
+    def _ir_tool_name(self, action_type: str) -> str:
+        mapping = {
+            "navigate": "navigate",
+            "click": "click",
+            "fill": "fill",
+            "assert_text": "assertTextPresent",
+            "assert_visible": "assertElementVisible",
+            "wait": "wait",
+            "scroll": "scroll",
+        }
+        return mapping.get(action_type, "")
+
+    def _ir_tool_input(self, action: AgentAction) -> Dict[str, Any]:
+        if action.type == "navigate":
+            return {"url": action.url or ""}
+        if action.type == "click":
+            return {"ref": action.target_ref, "targetDescription": action.target_desc or action.description}
+        if action.type == "fill":
+            text = action.fill_value or action.text or ""
+            return {
+                "ref": action.target_ref,
+                "targetDescription": action.target_desc or action.description,
+                "text": text,
+                "fillValue": {"kind": "literal", "value": text},
+            }
+        if action.type == "assert_text":
+            return {"text": action.expected or action.text or action.description}
+        if action.type == "assert_visible":
+            return {"ref": action.target_ref, "targetDescription": action.target_desc or action.description}
+        if action.type == "wait":
+            return {"seconds": action.seconds}
+        if action.type == "scroll":
+            return {"direction": action.direction, "amount": action.amount}
+        return {}
+
+    def _ir_element_record(self, action: AgentAction) -> Optional[Dict[str, Any]]:
+        desc = action.target_desc or action.description or action.target_ref
+        if action.type not in {"click", "fill", "assert_visible"} or not desc:
+            return None
+        locator_code = ""
+        if action.target_ref:
+            locator_code = f"page.locator('[data-testforge-ref=\"{self._escape_locator(action.target_ref)}\"]')"
+        else:
+            locator_code = f"page.get_by_text('{self._escape_locator(desc)}')"
+        return {
+            "fingerprint": {
+                "textSnippet": desc[:120],
+                "tagName": "",
+            },
+            "locatorCandidates": [{"kind": "testforge", "code": locator_code}],
+            "chosenLocator": {"kind": "testforge", "code": locator_code},
+        }
+
+    def _escape_locator(self, text: str) -> str:
+        return str(text or "").replace("\\", "\\\\").replace("'", "\\'")
+
     def _action_looks_like_search_fill(self, action: AgentAction) -> bool:
         text = " ".join([
             action.description,
@@ -1527,6 +3047,62 @@ class MainAgent:
             action.text,
         ]).lower()
         return action.type == "fill" and any(term in text for term in ["搜索", "search", "查询"])
+
+    def _record_locator_success(self, action: AgentAction):
+        desc = action.target_desc or action.description or action.target_ref
+        if not desc:
+            return
+        self.locator_memory.record(
+            self.context.current_url or getattr(self.page, "url", ""),
+            desc,
+            {
+                "tag": action.type,
+                "text": action.target_desc or action.description,
+                "href": action.url,
+                "role": "",
+            },
+        )
+
+    def _action_looks_like_protected_input(self, action: AgentAction) -> bool:
+        text = " ".join([
+            action.description,
+            action.target_desc,
+            action.target_ref,
+            action.text,
+        ]).lower()
+        return action.type == "fill" and any(
+            term in text for term in ["评论", "留言", "comment", "点赞", "like", "发文章", "发布"]
+        )
+
+    async def _recover_auth_required_action(self, action: AgentAction) -> Optional[ExecutorResult]:
+        """When a protected input is blocked, click login and re-plan."""
+        auth = await self.executor.extract_auth_requirements()
+        if not auth.ok or not auth.data.get("auth_required"):
+            return None
+
+        print("  页面提示需要登录，先进入登录流程...")
+        if self._current_user_task_text and not self._looks_like_explicit_login_test(self._current_user_task_text):
+            self._pending_resume = {
+                "task": self._current_user_task_text,
+                "url": self.context.current_url or getattr(self.page, "url", ""),
+            }
+        links = auth.data.get("login_links") or []
+        if links:
+            first = links[0]
+            click_result = await self.executor.click(
+                ref=first.get("ref", ""),
+                description=first.get("text") or "点击登录",
+            )
+        else:
+            best = await self.executor.find_best_entry(["点击登录", "请登录", "登录", "login", "sign in"])
+            if not best:
+                return ExecutorResult(type=ResultType.FAILURE, reason="页面需要登录，但找不到登录入口")
+            click_result = await self.executor.click(ref=best["ref"], description="点击登录")
+
+        if click_result.ok:
+            click_result.summary = "已进入登录入口，继续规划登录后再执行原任务"
+            click_result.data["needs_replan"] = True
+        return click_result
 
     def _task_needs_open_article(self) -> bool:
         if not self._current_task_state:
@@ -1582,6 +3158,27 @@ class MainAgent:
     async def _evaluate_task_completion(self, task: str) -> Dict[str, Any]:
         """Check whether the high-level user task is complete enough."""
         task_lower = (task or "").lower()
+        if self._looks_like_load_test_request(task):
+            load_done = any(
+                "压力" in feature or "压测" in feature or "load" in feature.lower()
+                for feature in self.context.tested_features
+            )
+            if load_done:
+                return {"done": True, "summary": "压力测试已完成"}
+
+        if any(term in task_lower for term in ["性能测试", "页面质量", "质量检查", "安全检查", "安全基础测试", "无障碍", "可访问性", "performance", "audit", "security", "a11y"]):
+            audit_done = any(
+                term in feature
+                for feature in self.context.tested_features
+                for term in ["性能", "质量", "安全", "无障碍"]
+            )
+            if audit_done:
+                return {"done": True, "summary": "工程审计已完成"}
+
+        if any(term in task_lower for term in ["生成报告", "测试报告", "导出报告", "report"]):
+            if self.context.reports:
+                return {"done": True, "summary": "测试报告已生成"}
+
         if not self._has_post_navigation_task(task):
             return {"done": True, "summary": "当前任务已执行"}
 
@@ -1673,6 +3270,7 @@ class MainAgent:
             if result.data.get("url"):
                 self.context.add_page(result.data["url"])
             await self._after_login_success()
+            await self._resume_after_login_if_needed()
             return
 
         print(f"  ✗ {result.reason}")
@@ -1691,9 +3289,68 @@ class MainAgent:
 
     async def _after_login_success(self):
         """Analyze the page after login so the conversation keeps moving."""
+        await self._stabilize_after_login_page()
         print("  登录后可以继续测试的功能如下：")
         await self._analyze_and_report_page()
         print("  你可以直接说：测试搜索、测试写文章、测试留言、测试后台入口，或导入 Markdown 用例。")
+
+    async def _stabilize_after_login_page(self):
+        """After auth redirects, move from a thin auth landing page to site root."""
+        try:
+            await asyncio.sleep(0.5)
+            snapshot = await self.executor.get_snapshot()
+        except Exception:
+            return
+        if snapshot.type != ResultType.SUCCESS:
+            return
+
+        elements = snapshot.data.get("elements") or []
+        current_url = snapshot.data.get("url") or self.context.current_url or getattr(self.page, "url", "")
+        if len(elements) > 5 and not self._url_looks_like_auth_page(current_url):
+            return
+
+        root = self._site_root_url(current_url)
+        if not root or root == current_url:
+            return
+
+        nav_result = await self.executor.navigate(root)
+        if nav_result.ok:
+            self.context.add_page(nav_result.data.get("url", root), nav_result.data.get("title", ""))
+            print(f"  已回到站点首页继续分析: {self.context.current_url}")
+
+    def _site_root_url(self, url: str) -> str:
+        try:
+            parsed = urlparse(url or "")
+        except Exception:
+            return ""
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}/"
+
+    def _url_looks_like_auth_page(self, url: str) -> bool:
+        try:
+            path = urlparse(url or "").path.lower()
+        except Exception:
+            return False
+        return any(token in path for token in ["login", "signin", "sign-in", "auth"])
+
+    async def _resume_after_login_if_needed(self):
+        """Return to the blocked page and continue the original user task after login."""
+        pending = getattr(self, "_pending_resume", {}) or {}
+        task = pending.get("task", "")
+        if not task:
+            return
+        self._pending_resume = {}
+        resume_url = pending.get("url", "")
+        if resume_url and resume_url != getattr(self.page, "url", ""):
+            print(f"  登录完成，回到原页面继续任务: {resume_url}")
+            nav_result = await self.executor.navigate(resume_url)
+            if nav_result.ok:
+                self.context.add_page(nav_result.data.get("url", resume_url), nav_result.data.get("title", ""))
+            else:
+                print(f"  回到原页面失败: {nav_result.reason}")
+        print("  登录完成，继续执行原任务...")
+        await self._run_planned_task(task)
 
     async def _ask_for_fields(self, fields: List[str]):
         """Ask and store fields requested by the plan or executor."""
@@ -1716,6 +3373,7 @@ class MainAgent:
         if result.type == ResultType.SUCCESS:
             if result.summary:
                 print(f"  ✓ {result.summary}")
+            self.context.add_event("agent", result.summary or "动作成功", {"result_type": "success", "data": dict(result.data)})
             # 更新上下文
             if result.data.get("url"):
                 self.context.add_page(result.data["url"])
@@ -1726,6 +3384,8 @@ class MainAgent:
                 "reason": result.reason,
                 "data": dict(result.data),
             }
+            self.context.add_event("agent", result.reason or "动作失败", {"result_type": "failure", "data": dict(result.data)})
+            await self._capture_failure_evidence(result.reason)
             # 提供恢复建议
             await self._suggest_recovery(result.reason)
 
@@ -1740,8 +3400,28 @@ class MainAgent:
 
         elif result.type == ResultType.DONE:
             print(f"  ✓ {result.summary}")
+            self.context.add_event("agent", result.summary or "任务完成", {"result_type": "done", "data": dict(result.data)})
             if result.data.get("url"):
                 self.context.add_page(result.data["url"])
+
+    async def _capture_failure_evidence(self, reason: str):
+        if self._is_page_closed():
+            return
+        try:
+            snapshot = await self.executor.get_snapshot()
+            snapshot_data = snapshot.data if snapshot.type == ResultType.SUCCESS else {}
+            path = await self.evidence.capture_failure(
+                self.page,
+                self.context.session_name,
+                reason,
+                snapshot_data,
+                self.network_recorder.records,
+            )
+            await self._save_trace_to(path)
+            self.context.artifacts.append(str(path))
+            print(f"  失败证据已保存: {path}")
+        except Exception:
+            pass
 
     async def _suggest_recovery(self, reason: str):
         """给出失败恢复建议"""
@@ -1759,6 +3439,20 @@ class MainAgent:
   测试登录 / 测试注册        - 测试对应功能
   运行 specs/login.md       - 导入并执行 Markdown 测试用例
   性能测试 当前页面/URL       - 采集加载耗时、FCP、资源体积、慢资源
+  压力测试 URL 20次 并发2    - 受控 HTTP 压测，输出 RPS/P95/错误率
+  页面质量检查 当前页面/URL    - 检查无障碍、基础 SEO、链接/表单安全
+  测试计划 / 站点地图          - 生成测试矩阵或当前页面功能图
+  测试当前页面所有已知功能      - 安全冒烟测试页面已发现入口
+  探索站点 URL 深度2 页面20     - 带 URL Scope 的深度探索并保存 graph/elements/transcript
+  全量测试 URL                - 一键运行安全全套测试并生成报告
+  网络日志 / API测试           - 查看接口、慢请求、失败请求
+  安全检查 / 无障碍检查        - 安全响应头、混合内容、a11y 基础检查
+  保存基线 name / 视觉对比 name - 视觉回归基线和对比
+  测试数据 用户/评论/文章      - 生成并记录测试数据
+  生成报告 html/json/junit/all - 导出会话测试报告
+  导出 Playwright 用例         - 将交互动作 IR 导出成 Playwright Python 测试骨架
+  回归测试 blog-test           - 加载历史会话并重跑用户任务
+  生成CI配置 / Agent分工       - 生成 GitHub Actions 模板或查看角色
   保存会话 blog-test         - 保存当前测试会话到本地
   加载会话 blog-test         - 加载会话并恢复页面
   会话列表 / 新建会话 name    - 管理本地测试项目/会话
@@ -1794,7 +3488,12 @@ async def run_spec_file_once(spec_path: str) -> bool:
     playwright = browser_result.get("playwright")
     context = browser_result.get("context")
     if context is None:
-        context = await browser.new_context(viewport={"width": 1440, "height": 900})
+        video_dir = Path.home() / ".testforge" / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            record_video_dir=str(video_dir),
+        )
     page = await context.new_page()
 
     try:

@@ -139,6 +139,12 @@ class ExecutorAgent:
             return ExecutorResult(type=ResultType.SUCCESS, data=result.data)
         return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
 
+    async def extract_links(self) -> ExecutorResult:
+        result = await tools.extract_links(self.page)
+        if result.ok:
+            return ExecutorResult(type=ResultType.SUCCESS, data=result.data)
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
     async def extract_like_buttons(self) -> ExecutorResult:
         result = await tools.extract_like_buttons(self.page)
         if result.ok:
@@ -171,6 +177,64 @@ class ExecutorAgent:
                 type=ResultType.SUCCESS,
                 data=result.data,
                 summary=f"性能评分 {summary.get('score', 0)}/100 ({summary.get('rating', 'unknown')})",
+            )
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
+    async def load_test(
+        self,
+        url: str = "",
+        requests: int = 20,
+        concurrency: int = 2,
+        method: str = "GET",
+        timeout: float = 10.0,
+    ) -> ExecutorResult:
+        result = await tools.load_test(
+            self.page,
+            url=url,
+            requests=requests,
+            concurrency=concurrency,
+            method=method,
+            timeout=timeout,
+        )
+        if result.ok:
+            summary = result.data.get("summary", {})
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data=result.data,
+                summary=f"压测完成: {summary.get('total', 0)} 请求, P95 {summary.get('p95', 0)}ms",
+            )
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
+    async def quality_audit(self) -> ExecutorResult:
+        result = await tools.quality_audit(self.page)
+        if result.ok:
+            summary = result.data.get("summary", {})
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data=result.data,
+                summary=f"页面质量评分 {summary.get('score', 0)}/100",
+            )
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
+    async def security_audit(self) -> ExecutorResult:
+        result = await tools.security_audit(self.page)
+        if result.ok:
+            summary = result.data.get("summary", {})
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data=result.data,
+                summary=f"安全检查评分 {summary.get('score', 0)}/100",
+            )
+        return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
+
+    async def accessibility_audit(self) -> ExecutorResult:
+        result = await tools.accessibility_audit(self.page)
+        if result.ok:
+            summary = result.data.get("summary", {})
+            return ExecutorResult(
+                type=ResultType.SUCCESS,
+                data=result.data,
+                summary=f"无障碍检查评分 {summary.get('score', 0)}/100",
             )
         return ExecutorResult(type=ResultType.FAILURE, reason=result.error)
 

@@ -67,6 +67,12 @@ class PlanningAgent:
 - BrowserAgent: navigate/click/fill/scroll/wait
 - ExplorerAgent: extract_links/extract_search_results/extract_forms/extract_article_content/extract_auth_requirements/extract_like_buttons
 - PerformanceAgent: performance_audit，用浏览器 Performance API 采集页面加载、资源体积、慢资源
+- LoadTestAgent: load_test，对单个 URL 做受控 HTTP 并发请求，输出吞吐、P95、错误率
+- QualityAuditAgent: quality_audit，检查无障碍、基础 SEO、安全链接/表单问题
+- SecurityAgent: security_audit，检查安全响应头、混合内容、危险链接、表单安全
+- AccessibilityAgent: accessibility_audit，检查 alt/label/lang/H1/空按钮等基础无障碍
+- SuiteAgent: full_test_suite，一键执行测试计划、站点地图、质量、安全、无障碍、性能、低压压测、网络/API摘要和报告
+- FeatureTestAgent: known_feature_suite，安全测试当前页面/站点已发现的所有功能入口，不自动删除、退出、发布或付款
 - AuthAgent: test_login/test_register，并可请求 username/password/captcha
 - VerifierAgent: 验证 URL 变化、文本出现、登录状态、搜索结果、点赞/评论是否完成
 
@@ -79,7 +85,7 @@ class PlanningAgent:
   "ask_fields": ["username", "password"],
   "actions": [
     {{
-      "type": "navigate|test_login|test_register|analyze|performance_audit|extract_search_results|extract_forms|extract_article_content|extract_auth_requirements|extract_like_buttons|click|fill|assert_text|assert_visible|scroll|wait|ask_user",
+      "type": "navigate|test_login|test_register|analyze|generate_test_plan|full_test_suite|known_feature_suite|performance_audit|load_test|quality_audit|security_audit|accessibility_audit|extract_search_results|extract_forms|extract_article_content|extract_auth_requirements|extract_like_buttons|click|fill|assert_text|assert_visible|scroll|wait|ask_user",
       "description": "动作说明",
       "url": "只在 navigate 时填写",
       "target_ref": "当前页面元素 ref，例如 e12。没有当前页面元素时留空",
@@ -88,6 +94,10 @@ class PlanningAgent:
       "expected": "验证文本",
       "runs": 1,
       "reload": false,
+      "requests": 20,
+      "concurrency": 2,
+      "method": "GET",
+      "timeout": 10,
       "ask_fields": ["username", "password"]
     }}
   ]
@@ -109,6 +119,12 @@ class PlanningAgent:
 12. 如果页面文字或元素出现“请登录/请先登录/登录后/点击登录”，并且用户任务是评论、点赞、发文章等受保护操作，必须先规划 test_login 或 click “点击登录”，不要直接 fill 评论框。
 13. 如果评论框提示“请登录后发表评论”，当前状态就是未登录；不要把页面上的“登录/欢迎/后台”等普通文本当成已登录。
 14. 如果用户要求性能测试、加载速度、performance、测速，规划 performance_audit；如果用户给了 URL 且未打开目标页，先 navigate，再 performance_audit。
+15. 如果用户要求压力测试/压测/负载测试/load test/stress test，规划 load_test。默认 requests=20、concurrency=2；如果用户指定并发/次数，填入对应字段。
+16. 如果用户要求页面质量/无障碍/a11y/SEO/基础安全检查，规划 quality_audit；如有 URL 先 navigate。
+17. 如果用户明确要求安全检查，规划 security_audit；要求无障碍/可访问性时规划 accessibility_audit。
+18. 如果用户要求测试计划/测试矩阵，规划 generate_test_plan。
+19. 如果用户要求“完整测试/全量测试/全套测试/一键测试/生成完整报告”，规划 full_test_suite；如果用户给了 URL 且未打开目标页，先 navigate，再 full_test_suite。
+20. 如果用户要求“测试所有功能/全部功能/当前页面所有已知功能/能看到的功能都测一遍”，规划 known_feature_suite；如果用户给了 URL 且未打开目标页，先 navigate，再 known_feature_suite。
 """
 
     def _format_elements(self, elements: List[Dict[str, Any]], limit: int = 40) -> str:

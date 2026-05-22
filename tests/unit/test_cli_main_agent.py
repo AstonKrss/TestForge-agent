@@ -35,6 +35,13 @@ class TestMainAgentUrlExtraction:
 
         assert url == "https://www.baidu.com"
 
+    def test_extracts_bare_domain_before_full_test_words(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        url = agent._extract_url("对baidu.com这个完整 全量全部进行测试")
+
+        assert url == "https://www.baidu.com"
+
     def test_prepare_url_cleans_model_suffix(self):
         agent = MainAgent.__new__(MainAgent)
 
@@ -53,6 +60,13 @@ class TestMainAgentUrlExtraction:
         agent = MainAgent.__new__(MainAgent)
 
         url = agent._extract_url("帮我测试一下http://47.242.21.40/这个网站的搜索功能 搜索linux")
+
+        assert url == "http://47.242.21.40/"
+
+    def test_extracts_root_url_before_full_test_suffix_without_de(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        url = agent._extract_url("完整测试 对http://47.242.21.40/这个网站完整测试产出报告")
 
         assert url == "http://47.242.21.40/"
 
@@ -166,6 +180,67 @@ class TestMainAgentRequestHelpers:
 
         assert agent._looks_like_performance_request("性能测试当前页面 3 次")
         assert agent._extract_performance_runs("性能测试当前页面 3 次") == 3
+
+    def test_detects_load_test_request_and_params(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        assert agent._looks_like_load_test_request("压力测试 http://example.com 50次 并发5")
+        params = agent._extract_load_test_params("压力测试 http://example.com 50次 并发5 超时3")
+        assert params["requests"] == 50
+        assert params["concurrency"] == 5
+        assert params["timeout"] == 3
+
+    def test_detects_quality_request(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        assert agent._looks_like_quality_request("页面质量检查当前页面")
+        assert agent._looks_like_quality_request("a11y audit")
+
+    def test_detects_full_test_request(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        assert agent._looks_like_full_test_request("一键测试 http://example.com")
+        assert agent._looks_like_full_test_request("跑全套")
+        assert agent._looks_like_full_test_request("full suite")
+        assert agent._looks_like_full_test_request("对baidu.com这个完整 全量全部进行测试")
+        assert agent._looks_like_full_test_request("把这个网站全部都测试一遍")
+
+    def test_parse_plan_explore_options(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        depth, max_pages, mode, include, exclude = agent._parse_explore_options(
+            "探索站点 http://example.com 聚焦 深度3 页面12 include:/blog* exclude:/admin*",
+            "http://example.com/",
+        )
+
+        assert depth == 3
+        assert max_pages == 12
+        assert mode == "focused"
+        assert include == ["/blog*"]
+        assert exclude == ["/admin*"]
+
+    def test_normalizes_ai_test_plan_items(self):
+        agent = MainAgent.__new__(MainAgent)
+
+        items = agent._normalize_test_plan_items([
+            {
+                "feature": "商品下单",
+                "precondition": "已登录且购物车有商品",
+                "steps": "打开购物车 -> 提交订单 -> 检查支付页",
+                "expected": "订单创建成功",
+                "risk": "高",
+                "needs_login": "是",
+            }
+        ])
+
+        assert items == [{
+            "feature": "商品下单",
+            "precondition": "已登录且购物车有商品",
+            "steps": ["打开购物车", "提交订单", "检查支付页"],
+            "expected": "订单创建成功",
+            "risk": "高",
+            "needs_login": True,
+        }]
 
     def test_extract_search_keyword(self):
         agent = MainAgent.__new__(MainAgent)

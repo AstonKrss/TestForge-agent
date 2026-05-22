@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## 项目概述
 
-**TestForge** - AI驱动的Web测试自动化框架 v0.2.0
+**TestForge** - AI驱动的Web测试自动化框架 v0.3.0
 
 核心理念:
 - **Stable First** - 稳定性优先，优雅降级

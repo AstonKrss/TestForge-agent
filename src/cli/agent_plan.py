@@ -30,6 +30,10 @@ class AgentAction:
     seconds: float = 1.0
     runs: int = 1
     reload: bool = False
+    requests: int = 20
+    concurrency: int = 2
+    method: str = "GET"
+    timeout: float = 10.0
     ask_fields: List[str] = field(default_factory=list)
 
     @classmethod
@@ -69,6 +73,10 @@ class AgentAction:
             seconds=_as_float(data.get("seconds"), 1.0),
             runs=_as_int(data.get("runs"), 1),
             reload=_as_bool(data.get("reload"), False),
+            requests=_as_int(data.get("requests"), 20),
+            concurrency=_as_int(data.get("concurrency"), 2),
+            method=_as_str(data.get("method") or "GET") or "GET",
+            timeout=_as_float(data.get("timeout"), 10.0),
             ask_fields=[_as_str(field) for field in ask_fields if _as_str(field)],
         )
 
@@ -168,6 +176,13 @@ def normalize_agent_plan(raw: Dict[str, Any]) -> AgentPlan:
         "test_login",
         "test_register",
         "performance_audit",
+        "load_test",
+        "quality_audit",
+        "security_audit",
+        "accessibility_audit",
+        "generate_test_plan",
+        "full_test_suite",
+        "known_feature_suite",
     }:
         actions = [AgentAction.from_dict({**raw, "type": intent})]
 

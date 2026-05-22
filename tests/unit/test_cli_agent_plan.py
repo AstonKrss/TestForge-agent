@@ -64,3 +64,33 @@ def test_normalizes_performance_audit_action():
     assert plan.actions[0].type == "performance_audit"
     assert plan.actions[0].runs == 3
     assert plan.actions[0].reload is True
+
+
+def test_normalizes_load_and_quality_actions():
+    load_plan = normalize_agent_plan({
+        "intent": "load_test",
+        "requests": 50,
+        "concurrency": 5,
+        "method": "HEAD",
+        "timeout": 3,
+    })
+    quality_plan = normalize_agent_plan({"intent": "quality_audit"})
+
+    assert load_plan.actions[0].type == "load_test"
+    assert load_plan.actions[0].requests == 50
+    assert load_plan.actions[0].concurrency == 5
+    assert load_plan.actions[0].method == "HEAD"
+    assert load_plan.actions[0].timeout == 3
+    assert quality_plan.actions[0].type == "quality_audit"
+
+
+def test_normalizes_known_feature_suite_action():
+    plan = normalize_agent_plan({"intent": "known_feature_suite"})
+
+    assert plan.actions[0].type == "known_feature_suite"
+
+
+def test_normalizes_full_test_suite_action():
+    plan = normalize_agent_plan({"intent": "full_test_suite"})
+
+    assert plan.actions[0].type == "full_test_suite"

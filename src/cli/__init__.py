@@ -27,6 +27,10 @@ from .tools import (
     wait,
     screenshot,
     performance_audit,
+    load_test,
+    quality_audit,
+    security_audit,
+    accessibility_audit,
 )
 from .session_store import SessionStore
 
@@ -51,5 +55,9 @@ __all__ = [
     "wait",
     "screenshot",
     "performance_audit",
+    "load_test",
+    "quality_audit",
+    "security_audit",
+    "accessibility_audit",
     "SessionStore",
 ]
