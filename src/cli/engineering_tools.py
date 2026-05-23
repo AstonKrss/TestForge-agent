@@ -456,6 +456,18 @@ class ReportGenerator:
             if event.get("data", {}).get("result_type") in {"success", "done"}
             or str(event.get("text", "")).startswith("✓")
         ]
+        flow_results = []
+        for event in events:
+            for item in (event.get("data", {}) or {}).get("results", []) or []:
+                if isinstance(item, dict):
+                    flow_results.append(item)
+        flow_passed = sum(1 for item in flow_results if item.get("status") == "passed" or item.get("ok") is True)
+        flow_blocked = sum(1 for item in flow_results if item.get("status") == "blocked")
+        flow_failed = sum(1 for item in flow_results if item.get("status") == "failed" or item.get("ok") is False)
+        feature_graph = (context.get("site_map") or {}).get("feature_graph") or {}
+        graph_nodes = feature_graph.get("nodes") or []
+        graph_paths = feature_graph.get("paths") or []
+        suite_summaries = context.get("suite_summaries") or []
         pass_rate = round((len(passed_events) / max(1, len(passed_events) + len(failures))) * 100, 1)
         network = context.get("network") or {}
         lines = [
@@ -467,6 +479,9 @@ class ReportGenerator:
             f"- Events: {len(events)}",
             f"- Failures: {len(failures)}",
             f"- Pass rate: {pass_rate}%",
+            f"- Flow assertions: passed={flow_passed}, blocked={flow_blocked}, failed={flow_failed}",
+            f"- Page coverage: {len(graph_nodes) or len(context.get('page_history') or [])}",
+            f"- Feature paths: {len(graph_paths)}",
             f"- Defects: {len(context.get('defects') or [])}",
             f"- API failures: {network.get('failed', 0)}",
             f"- Evidence artifacts: {len(artifacts)}",
@@ -482,6 +497,22 @@ class ReportGenerator:
                 lines.append(f"- `{event.get('time', '')}` {event.get('text', '')}")
         else:
             lines.append("- No failed tool result recorded.")
+        lines.extend(["", "## Full Suite Summary"])
+        if suite_summaries:
+            for item in suite_summaries[-3:]:
+                lines.append(
+                    f"- {item.get('label') or item.get('mode')} | passed={item.get('passed', 0)} "
+                    f"blocked={item.get('blocked', 0)} failed={item.get('failed', 0)} "
+                    f"page_coverage={item.get('page_coverage', 0)}"
+                )
+                for reason in (item.get("not_tested_reasons") or [])[:8]:
+                    lines.append(f"  - Not tested: {reason}")
+        else:
+            lines.append("- No full-suite summary recorded.")
+        if graph_paths:
+            lines.extend(["", "## Feature Graph"])
+            for path in graph_paths[:40]:
+                lines.append(f"- {path}")
         lines.extend([
             "",
             "## Test Plan",
@@ -497,6 +528,11 @@ class ReportGenerator:
             lines.append(f"- Defect: {item.get('id')} {item.get('title')} | severity={item.get('severity')} | {item.get('path')}")
         for item in context.get("api_runs") or []:
             lines.append(f"- API run: {item.get('name')} | passed={item.get('passed')} failed={item.get('failed')} | {item.get('report_path')}")
+            for endpoint in (item.get("endpoints") or [])[:8]:
+                lines.append(
+                    f"  - {'PASS' if endpoint.get('ok') else 'FAIL'} {endpoint.get('method')} "
+                    f"{endpoint.get('path')} | status={endpoint.get('status')} | avg={endpoint.get('avg_duration')}ms"
+                )
         for item in context.get("sql_checks") or []:
             lines.append(f"- SQL: `{item.get('sql')}` | executed={item.get('executed')} | ok={item.get('ok', '')}")
         for item in context.get("jmeter_plans") or []:
@@ -513,6 +549,15 @@ class ReportGenerator:
             lines.extend(["", "## Slow API / Resources"])
             for record in network.get("slow", [])[:10]:
                 lines.append(f"- {record.get('duration')} ms | {record.get('status')} | {record.get('method')} {record.get('url')}")
+        if flow_results:
+            lines.extend(["", "## Executed Flow Assertions"])
+            for item in flow_results[:80]:
+                lines.append(
+                    f"- {item.get('status', 'unknown').upper()} | {item.get('feature', '')}: {item.get('reason', '')}"
+                )
+                not_tested = (item.get("data") or {}).get("not_tested_reason")
+                if not_tested:
+                    lines.append(f"  - Not tested reason: {not_tested}")
         lines.extend(["", "## Site Map"])
         site_map = context.get("site_map") or {}
         for item in (site_map.get("nodes") or site_map.get("links") or [])[:30]:

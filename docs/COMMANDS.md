@@ -111,17 +111,23 @@ Full suite includes:
 
 - test plan
 - sitemap
+- full-suite profiles: `冒烟测试`, `标准测试`, `深度测试`, and explicit `破坏性/状态变更测试`
 - known feature smoke test
 - executable safe functional flows such as search, article reading, login verification, and comment prerequisites
+- ExplorerAgent semantic analysis for every primary and nested feature page, so each page reports element count, page type, feature entries, and recommended test points
+- recursive feature graph generation with depth/page limits and unsafe-path filtering
 - deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, resources, RSS, register, and guestbook
 - nested feature checks inside section pages, for example tools -> practical resources / security tools / concrete tool pages
 - safe utility interaction probes for local transforms such as encode/decode/format/generate/hash
+- stricter assertions for search relevance, login evidence, comment/like blocking reasons, and tool output changes
 - quality audit
 - security audit
 - accessibility audit
 - performance audit
 - low-pressure load test
 - network/API summary
+- reusable test case export from the suite plan
+- enhanced report summary with pass rate, blockers, feature graph, page/function coverage, slow API ranking, and API assertion candidates
 - HTML and JSON report export
 
 ## Known Feature Smoke Test

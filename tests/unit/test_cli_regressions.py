@@ -328,3 +328,95 @@ def test_safe_tool_button_filter_allows_local_transform_only():
     assert agent._is_safe_tool_button({"text": "JSON 格式化"})
     assert not agent._is_safe_tool_button({"text": "开始扫描"})
     assert not agent._is_safe_tool_button({"text": "提交"})
+
+
+def test_report_snapshot_analysis_uses_rule_fallback_for_feature_page():
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext()
+    agent.page = type("Page", (), {"url": "http://example.com/tools"})()
+    agent.ai_client = None
+    snapshot = {
+        "url": "http://example.com/tools/security",
+        "title": "安全工具箱",
+        "text": "安全工具箱 Base64 编码 JSON 格式化 Hash 生成",
+        "elements": [
+            {"ref": "e1", "tag": "a", "text": "安全工具箱", "href": "http://example.com/tools/security"},
+            {"ref": "e2", "tag": "input", "placeholder": "请输入文本"},
+            {"ref": "e3", "tag": "button", "text": "Base64 编码"},
+        ],
+    }
+
+    analysis = asyncio.run(agent._report_snapshot_analysis(snapshot, indent="", label="工具箱"))
+
+    assert analysis["source"] == "规则兜底"
+    assert analysis["element_count"] == 3
+    assert "工具箱/实用工具页面" in analysis["summary"][0]
+    assert "安全工具箱" in analysis["summary"][1]
+    assert "安全本地转换" in analysis["summary"][2]
+
+
+def test_full_suite_profile_modes_are_bounded():
+    agent = MainAgent.__new__(MainAgent)
+
+    smoke = agent._parse_full_suite_profile("冒烟测试 http://example.com")
+    deep = agent._parse_full_suite_profile("深度测试 depth:3 pages:50")
+    destructive = agent._parse_full_suite_profile("破坏性全量测试 允许提交")
+
+    assert smoke["mode"] == "smoke"
+    assert smoke["run_flows"] is False
+    assert deep["mode"] == "deep"
+    assert deep["max_depth"] == 3
+    assert deep["max_pages"] == 50
+    assert destructive["allow_state_change"] is True
+
+
+def test_search_assertion_requires_keyword_relevance():
+    agent = MainAgent.__new__(MainAgent)
+
+    ok = agent._assert_search_results_contain_keyword(
+        "linux",
+        {"total": 2, "results": [{"text": "Linux 命令", "href": "/blog/linux"}]},
+        "",
+        "http://example.com/search?q=linux",
+    )
+    bad = agent._assert_search_results_contain_keyword(
+        "linux",
+        {"total": 2, "results": [{"text": "数据库教程", "href": "/blog/db"}]},
+        "",
+        "http://example.com/search",
+    )
+
+    assert ok["ok"] is True
+    assert ok["matched_count"] == 1
+    assert bad["ok"] is False
+
+
+def test_recursive_child_candidates_skip_common_nav_and_keep_feature_children():
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext()
+    parent = {"feature": "工具箱", "href": "http://example.com/tools", "label": "工具箱"}
+    snapshot = {
+        "url": "http://example.com/tools",
+        "elements": [
+            {"text": "首页", "href": "http://example.com/"},
+            {"text": "博客", "href": "http://example.com/blog"},
+            {"text": "Base64 编码", "href": "http://example.com/tools/base64"},
+            {"text": "安全工具箱", "href": "http://example.com/tools/security"},
+        ],
+    }
+
+    candidates = agent._recursive_child_candidates(parent, snapshot, depth=1)
+
+    assert [item["label"] for item in candidates] == ["安全工具箱", "Base64 编码"]
+
+
+def test_click_risk_category_blocks_comment_submit_but_allows_login():
+    agent = MainAgent.__new__(MainAgent)
+    agent.context = SessionContext(current_url="http://example.com/blog/a")
+    agent.page = type("Page", (), {"url": "http://example.com/blog/a"})()
+
+    comment = AgentAction(type="click", description="提交评论")
+    login = AgentAction(type="click", description="登录")
+
+    assert agent._click_risk_category(comment) == "comment_submit"
+    assert agent._click_risk_category(login) == "login_submit"

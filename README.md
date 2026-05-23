@@ -6,7 +6,7 @@
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-blue">
   <img alt="Playwright" src="https://img.shields.io/badge/Browser-Playwright-45ba63">
   <img alt="AI Agents" src="https://img.shields.io/badge/AI-Multi--Agent-purple">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-173%20passed-brightgreen">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-178%20passed-brightgreen">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-black">
 </p>
 
@@ -127,11 +127,15 @@ TestForge 会执行：
 
 - 生成测试计划矩阵
 - 生成站点地图
+- 按模式执行：`冒烟测试`、`标准测试`、`深度测试`、`破坏性/状态变更测试`
 - 打开并检查已发现入口
+- 对每个一级/二级功能页重新做 ExplorerAgent 页面分析，输出页面元素数量、页面类型、功能入口和建议测试点
+- 递归生成完整功能图，例如：首页 -> 工具箱 -> 安全工具 -> Base64 编码
 - 深度检查归档、标签、留言、友链、项目、工具箱、游戏、相册、资源、注册、登录等功能页
-- 对搜索、文章阅读、登录、评论前置条件等安全流程做真实操作
+- 对搜索、文章阅读、登录、评论/点赞前置条件等流程做更严格断言
+- 自动沉淀测试用例，供后续回归测试复用
 - 执行质量、安全、无障碍、性能、低压压测和网络/API 摘要
-- 输出 HTML / JSON 报告
+- 输出 HTML / JSON 报告，包含通过率、阻塞原因、功能图、慢接口、API 断言候选和可复制缺陷线索
 
 ### 常用调试命令
 
@@ -177,18 +181,23 @@ The full suite runs:
 
 - site exploration and sitemap
 - site-specific test matrix
+- full-suite profiles: smoke, standard, deep, and explicit destructive/state-changing mode
 - known feature smoke testing
 - executable functional flows for safe paths such as search, article reading, login verification, and comment prerequisites
+- ExplorerAgent semantic analysis for every primary and nested feature page, including element count, page type, feature entries, and recommended test points
+- recursive feature graph generation with depth/page limits and unsafe-path filtering
 - deep checks for discovered sections such as archive, tags, friends, projects, tools, games, photos, travel, resources, RSS, terminal, register, and guestbook
 - nested feature checks inside section pages, for example tools -> practical resources / security tools / concrete tool pages
 - safe utility interaction probes for local transforms such as encode/decode/format/generate/hash
+- stricter assertions for search relevance, login evidence, comments/likes blocking reasons, and tool output changes
 - page quality audit
 - basic security audit
 - accessibility audit
 - performance audit
 - low-pressure HTTP load test
 - network/API summary
-- HTML and JSON reports
+- reusable test case export from the suite plan
+- HTML and JSON reports with coverage, blockers, feature graph, slow API ranking, and API assertion candidates
 
 ### Known Feature Smoke Test
 
@@ -401,7 +410,7 @@ python -m pytest tests/unit/ -q
 Current baseline:
 
 ```text
-173 passed
+178 passed
 ```
 
 ## Roadmap

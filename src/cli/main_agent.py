@@ -111,6 +111,7 @@ class SessionContext:
     jmeter_plans: List[Dict[str, Any]] = field(default_factory=list)
     environment_checks: List[Dict[str, Any]] = field(default_factory=list)
     regression_results: List[Dict[str, Any]] = field(default_factory=list)
+    suite_summaries: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_page(self, url: str, title: str = ""):
         self.current_url = url
@@ -176,6 +177,7 @@ class SessionContext:
             "jmeter_plans": list(self.jmeter_plans),
             "environment_checks": list(self.environment_checks),
             "regression_results": list(self.regression_results),
+            "suite_summaries": list(self.suite_summaries),
             "events": list(self.events),
         }
 
@@ -212,6 +214,7 @@ class SessionContext:
             "jmeter_plans",
             "environment_checks",
             "regression_results",
+            "suite_summaries",
             "events",
         ):
             if key in data:
@@ -292,6 +295,9 @@ class MainAgent:
         self._task_consecutive_failures = 0
         self._max_actions_per_task = 40
         self._max_consecutive_failures = 5
+        self._allow_state_changing_actions = False
+        self._full_suite_mode = "deep"
+        self._url_visit_counts: Dict[str, int] = {}
         self.network_recorder.attach(page)
 
     # ─── 对话入口 ─────────────────────────────────────────────────────────────
@@ -728,6 +734,7 @@ class MainAgent:
         self._task_consecutive_failures = 0
         self._action_repeat_counts = {}
         self._used_recoveries = set()
+        self._url_visit_counts = {}
 
         for round_index in range(1, self.MAX_REPLAN_ROUNDS + 1):
             if round_index > 1:
@@ -1202,44 +1209,122 @@ class MainAgent:
 
     async def _run_full_test_suite(self, user_input: str):
         """Run a safe one-command full test suite and export a report."""
+        profile = self._parse_full_suite_profile(user_input)
+        previous_allow_state_change = self._allow_state_changing_actions
+        previous_suite_mode = self._full_suite_mode
+        self._allow_state_changing_actions = profile["allow_state_change"]
+        self._full_suite_mode = profile["mode"]
         self.network_recorder.clear()
         url = self._extract_url(user_input)
-        if url:
-            previous_auto_plan = self._suppress_auto_plan
-            self._suppress_auto_plan = True
-            try:
-                nav_result = await self._handle_navigate(url)
-            finally:
-                self._suppress_auto_plan = previous_auto_plan
-            if not nav_result or not nav_result.ok:
-                print("  全量测试停止：目标页面无法打开，后续审计不会继续使用旧页面。")
+        try:
+            if url:
+                previous_auto_plan = self._suppress_auto_plan
+                self._suppress_auto_plan = True
+                try:
+                    nav_result = await self._handle_navigate(url)
+                finally:
+                    self._suppress_auto_plan = previous_auto_plan
+                if not nav_result or not nav_result.ok:
+                    print("  全量测试停止：目标页面无法打开，后续审计不会继续使用旧页面。")
+                    return
+            elif not self._has_open_page():
+                print("  请先打开一个页面，或直接说：全量测试 http://example.com")
                 return
-        elif not self._has_open_page():
-            print("  请先打开一个页面，或直接说：全量测试 http://example.com")
-            return
 
-        print("\n[一键全量测试]")
-        print("  范围: 测试计划、站点地图、入口冒烟、可执行功能流、质量、安全、无障碍、性能、低压压测、网络/API摘要、报告")
-        print("  安全策略: 可安全验证的功能会实际执行；发文章/评论等会创建数据的动作默认只做到提交前")
+            print("\n[一键全量测试]")
+            print(f"  模式: {profile['label']} | 深度: {profile['max_depth']} | 页面上限: {profile['max_pages']}")
+            print("  范围: 测试计划、站点地图、入口冒烟、递归功能图、可执行功能流、质量、安全、无障碍、性能、低压压测、网络/API摘要、报告")
+            if profile["allow_state_change"]:
+                print("  安全策略: 已启用破坏性/状态变更模式；仍会拦截删除、支付、退出等高危动作，除非命令明确确认。")
+            else:
+                print("  安全策略: 可安全验证的功能会实际执行；发文章/评论/注册/删除/支付等状态变更动作默认停在提交前")
 
-        await self._generate_and_show_test_plan()
-        await self._generate_site_map()
-        suite_root_url = self.context.current_url or getattr(self.page, "url", "")
-        await self._run_known_feature_suite("", from_full_suite=True)
-        await self._run_functional_flow_suite(suite_root_url)
-        await self._run_quality_audit("")
-        await self._run_security_audit("")
-        await self._run_accessibility_audit("")
-        await self._run_performance_audit("性能测试 当前页面 2次")
+            self._suite_phase("生成测试计划")
+            await self._generate_and_show_test_plan()
+            self._suite_phase("生成站点地图")
+            await self._generate_site_map()
+            suite_root_url = self.context.current_url or getattr(self.page, "url", "")
 
-        current_url = self.context.current_url or getattr(self.page, "url", "")
-        if current_url and current_url != "about:blank":
-            await self._run_load_test(f"压力测试 {current_url} 20次 并发2")
+            self._suite_phase("入口冒烟")
+            await self._run_known_feature_suite("", from_full_suite=True)
 
-        self._show_network_report()
-        await self._generate_report("生成报告 html")
-        await self._generate_report("生成报告 json")
-        print("  ✓ 一键全量测试完成")
+            if profile["run_recursive"]:
+                self._suite_phase("递归功能探索")
+                await self._run_recursive_feature_exploration(
+                    max_depth=profile["max_depth"],
+                    max_pages=profile["max_pages"],
+                )
+
+            if profile["run_flows"]:
+                self._suite_phase("业务功能流")
+                await self._run_functional_flow_suite(suite_root_url)
+
+            if profile["run_audits"]:
+                self._suite_phase("质量/安全/无障碍")
+                await self._run_quality_audit("")
+                await self._run_security_audit("")
+                await self._run_accessibility_audit("")
+
+            if profile["run_performance"]:
+                self._suite_phase("性能测试")
+                await self._run_performance_audit("性能测试 当前页面 2次")
+
+            current_url = self.context.current_url or getattr(self.page, "url", "")
+            if profile["run_load"] and current_url and current_url != "about:blank":
+                self._suite_phase("低压压测")
+                await self._run_load_test(f"压力测试 {current_url} 20次 并发2")
+
+            self._suite_phase("网络/API摘要")
+            self._show_network_report()
+            await self._auto_save_suite_test_cases()
+            await self._generate_report("生成报告 html")
+            await self._generate_report("生成报告 json")
+            self._record_full_suite_summary(profile)
+            print("  ✓ 一键全量测试完成")
+        finally:
+            self._allow_state_changing_actions = previous_allow_state_change
+            self._full_suite_mode = previous_suite_mode
+
+    def _parse_full_suite_profile(self, text: str) -> Dict[str, Any]:
+        lower = (text or "").lower()
+        mode = "deep"
+        if any(term in lower for term in ["冒烟", "smoke"]):
+            mode = "smoke"
+        elif any(term in lower for term in ["标准", "standard"]):
+            mode = "standard"
+        elif any(term in lower for term in ["破坏性", "状态变更", "真实提交", "destructive"]):
+            mode = "destructive"
+        elif any(term in lower for term in ["深度", "深入", "递归", "deep"]):
+            mode = "deep"
+
+        depth_match = re.search(r"(?:深度|depth)\s*[:：=]?\s*(\d+)", text or "", re.I)
+        page_match = re.search(r"(?:页面|pages?|max_pages)\s*[:：=]?\s*(\d+)", text or "", re.I)
+        default_depth = 1 if mode == "standard" else (0 if mode == "smoke" else 2)
+        default_pages = 12 if mode == "standard" else (0 if mode == "smoke" else 30)
+        max_depth = max(0, min(int(depth_match.group(1)) if depth_match else default_depth, 4))
+        max_pages = max(0, min(int(page_match.group(1)) if page_match else default_pages, 80))
+        allow_state_change = mode == "destructive" or any(term in lower for term in ["允许提交", "确认提交", "允许创建", "确认发布", "confirm submit"])
+
+        return {
+            "mode": mode,
+            "label": {
+                "smoke": "冒烟测试",
+                "standard": "标准测试",
+                "deep": "深度测试",
+                "destructive": "破坏性/状态变更测试",
+            }.get(mode, "深度测试"),
+            "max_depth": max_depth,
+            "max_pages": max_pages,
+            "allow_state_change": allow_state_change,
+            "run_recursive": mode in {"standard", "deep", "destructive"} and max_pages > 0,
+            "run_flows": mode in {"standard", "deep", "destructive"},
+            "run_audits": mode in {"standard", "deep", "destructive"},
+            "run_performance": mode in {"standard", "deep", "destructive"},
+            "run_load": mode in {"standard", "deep", "destructive"},
+        }
+
+    def _suite_phase(self, name: str) -> None:
+        print(f"\n[阶段] {name}")
 
     async def _run_load_test(self, user_input: str):
         """Run a bounded HTTP load test."""
@@ -1427,6 +1512,7 @@ class MainAgent:
         results: List[Dict[str, Any]] = []
         await self._run_search_functional_flow(results)
         await self._run_article_functional_flow(results)
+        await self._run_like_functional_probe(results)
         await self._run_login_functional_flow(results)
         await self._run_comment_functional_probe(results)
         await self._run_discovered_feature_detail_flows(results)
@@ -1483,13 +1569,15 @@ class MainAgent:
         current_url = getattr(self.page, "url", "")
         extracted = await self.executor.extract_search_results()
         total = extracted.data.get("total", 0) if extracted.ok else 0
-        ok = keyword.lower() in (current_url + " " + page_text).lower() or total > 0
+        assertion = self._assert_search_results_contain_keyword(keyword, extracted.data if extracted.ok else {}, page_text, current_url)
+        ok = assertion["ok"]
         status = "passed" if ok else "failed"
-        reason = f"关键词 {keyword} 搜索完成，结果 {total} 条" if ok else f"搜索后未观察到关键词 {keyword} 或结果列表"
+        reason = assertion["reason"]
         self._append_flow_result(results, "搜索功能", status, reason, {
             "keyword": keyword,
             "url": current_url,
             "result_count": total,
+            "matched_count": assertion.get("matched_count", 0),
             "submit_clicked": clicked.ok,
         })
         print(f"    {'✓' if ok else '✗'} {reason}")
@@ -1501,6 +1589,49 @@ class MainAgent:
                 print(f"    ✓ {opened.summary}")
             elif opened:
                 self._append_flow_result(results, "搜索结果文章打开", "failed", opened.reason)
+
+    def _assert_search_results_contain_keyword(
+        self,
+        keyword: str,
+        extracted_data: Dict[str, Any],
+        page_text: str,
+        current_url: str,
+    ) -> Dict[str, Any]:
+        keyword = (keyword or "").strip().lower()
+        results = extracted_data.get("results") or []
+        total = int(extracted_data.get("total") or len(results) or 0)
+        if not keyword:
+            return {"ok": total > 0, "reason": f"搜索完成，结果 {total} 条", "matched_count": total}
+
+        haystack = f"{current_url} {page_text}".lower()
+        matched = []
+        for item in results:
+            blob = " ".join(str(item.get(key, "")) for key in ("text", "title", "summary", "href", "description")).lower()
+            if keyword in blob:
+                matched.append(item)
+        if matched:
+            return {
+                "ok": True,
+                "reason": f"关键词 {keyword} 搜索完成，结果 {total} 条，其中 {len(matched)} 条标题/摘要/链接包含关键词",
+                "matched_count": len(matched),
+            }
+        if keyword in haystack and total > 0:
+            return {
+                "ok": True,
+                "reason": f"关键词 {keyword} 搜索完成，页面包含关键词，结果 {total} 条",
+                "matched_count": 0,
+            }
+        if total > 0:
+            return {
+                "ok": False,
+                "reason": f"搜索返回 {total} 条，但标题/摘要/链接未包含关键词 {keyword}，需要人工确认相关性",
+                "matched_count": 0,
+            }
+        return {
+            "ok": False,
+            "reason": f"搜索后未观察到关键词 {keyword} 或结果列表",
+            "matched_count": 0,
+        }
 
     async def _run_article_functional_flow(self, results: List[Dict[str, Any]]) -> None:
         print("  ArticleFlowAgent: 文章阅读 - 打开文章并检查正文")
@@ -1579,14 +1710,57 @@ class MainAgent:
             await self.executor.navigate(href)
         login = await self.executor.login(username, password)
         if login.ok:
-            self.context.is_logged_in = True
-            self.context.logged_in_user = username
-            self._append_flow_result(results, "登录/认证", "passed", login.summary, {"fields": fields})
-            print(f"    ✓ {login.summary}")
+            assertion = await self._assert_login_contract(login)
+            if assertion["ok"]:
+                self.context.is_logged_in = True
+                self.context.logged_in_user = username
+            status = "passed" if assertion["ok"] else "blocked"
+            self._append_flow_result(results, "登录/认证", status, assertion["reason"], {
+                "fields": fields,
+                **assertion.get("data", {}),
+            })
+            marker = "✓" if assertion["ok"] else "!"
+            print(f"    {marker} {assertion['reason']}")
         else:
             self.context.is_logged_in = False
             self._append_flow_result(results, "登录/认证", "failed", login.reason, {"fields": fields})
             print(f"    ✗ 登录失败: {login.reason}")
+
+    async def _assert_login_contract(self, login: ExecutorResult) -> Dict[str, Any]:
+        """Require concrete auth evidence instead of treating form disappearance as success."""
+        data = dict(login.data or {})
+        artifacts = data.get("auth_artifacts") or {}
+        summary = login.summary or ""
+        if artifacts.get("has_auth_artifact"):
+            return {
+                "ok": True,
+                "reason": "登录成功：检测到认证 token/cookie/localStorage 标识（未读取敏感值）",
+                "data": {"auth_artifacts": artifacts, "assertion": "auth_artifact"},
+            }
+        if "登录后标识" in summary:
+            return {
+                "ok": True,
+                "reason": "登录成功：检测到用户入口/退出/后台等登录后标识",
+                "data": {"assertion": "logged_in_indicator"},
+            }
+        detect = await self.executor.detect_login_page()
+        if detect.type == ResultType.NO_AUTH_NEEDED:
+            return {
+                "ok": True,
+                "reason": f"登录成功：{detect.summary or '页面已处于免登录/已登录状态'}",
+                "data": {"assertion": "detect_no_auth_needed"},
+            }
+        if "登录已提交" in summary or "表单已消失" in summary:
+            return {
+                "ok": False,
+                "reason": "登录动作已提交，但没有检测到 token/cookie、用户入口或退出按钮；本次只标记为阻塞，不能当成登录成功",
+                "data": {"assertion": "unconfirmed_login"},
+            }
+        return {
+            "ok": True,
+            "reason": summary or "登录成功",
+            "data": {"assertion": "executor_success"},
+        }
 
     async def _run_comment_functional_probe(self, results: List[Dict[str, Any]]) -> None:
         href = self._feature_or_common_href("comment", ["/guestbook"])
@@ -1606,15 +1780,52 @@ class MainAgent:
         form_count = forms.data.get("total", 0) if forms.ok else 0
         auth_required = bool(auth.ok and auth.data.get("auth_required"))
         if auth_required and not self.context.is_logged_in:
-            self._append_flow_result(results, "评论/留言", "blocked", "页面提示需要登录；未发布评论", {"form_count": form_count})
+            self._append_flow_result(results, "评论/留言", "blocked", "页面提示需要登录；未发布评论", {"form_count": form_count, "not_tested_reason": "缺少登录态"})
             print("    ! 页面提示需要登录；未发布评论")
             return
         if form_count > 0:
-            self._append_flow_result(results, "评论/留言", "passed", "评论/留言表单存在；已停在提交前，避免创建真实数据", {"form_count": form_count})
+            self._append_flow_result(results, "评论/留言", "blocked", "评论/留言表单存在；已停在提交前，避免创建真实数据", {"form_count": form_count, "not_tested_reason": "评论会创建真实数据"})
             print("    ✓ 评论/留言表单存在；已停在提交前")
             return
         self._append_flow_result(results, "评论/留言", "blocked", "未发现可填写的评论/留言表单", {"form_count": form_count})
         print("    ! 未发现可填写的评论/留言表单")
+
+    async def _run_like_functional_probe(self, results: List[Dict[str, Any]]) -> None:
+        current_url = getattr(self.page, "url", "") or self.context.current_url
+        if "/blog/" not in current_url:
+            return
+        print("  LikeFlowAgent: 点赞功能 - 检查按钮和状态变化条件")
+        extracted = await self.executor.extract_like_buttons()
+        buttons = extracted.data.get("buttons") or extracted.data.get("candidates") or [] if extracted.ok else []
+        total = extracted.data.get("total", len(buttons)) if extracted.ok else 0
+        if not extracted.ok or total == 0:
+            self._append_flow_result(results, "点赞功能", "blocked", "文章页未识别到点赞按钮", {"url": current_url})
+            print("    ! 文章页未识别到点赞按钮")
+            return
+        if not self._allow_state_changing_actions:
+            self._append_flow_result(results, "点赞功能", "blocked", "发现点赞按钮，但点赞会改变状态；默认不执行。需要真实测试可说“破坏性全量测试/允许状态变更”", {
+                "url": current_url,
+                "button_count": total,
+                "not_tested_reason": "点赞会改变用户状态",
+            })
+            print("    ! 已发现点赞按钮；默认不点击，避免改变真实状态")
+            return
+        before = await self.executor.get_snapshot()
+        before_text = before.data.get("text", "") if before.ok else ""
+        first = buttons[0] if buttons else {}
+        click = await self.executor.click(ref=first.get("ref", ""), description=first.get("text") or "点赞")
+        if not click.ok:
+            self._append_flow_result(results, "点赞功能", "failed", f"点赞按钮点击失败: {click.reason}", {"url": current_url})
+            print(f"    ✗ 点赞按钮点击失败: {click.reason}")
+            return
+        await self.executor.wait(0.5)
+        after = await self.executor.get_snapshot()
+        after_text = after.data.get("text", "") if after.ok else ""
+        changed = after_text != before_text
+        status = "passed" if changed else "blocked"
+        reason = "点赞后页面状态发生变化，已确认点赞交互触发" if changed else "已点击点赞，但页面文本未变化，无法确认点赞数+1或状态变化"
+        self._append_flow_result(results, "点赞功能", status, reason, {"url": current_url, "button_count": total, "state_changed": changed})
+        print(f"    {'✓' if changed else '!'} {reason}")
 
     async def _run_register_probe_from_current_page(self, results: List[Dict[str, Any]]) -> bool:
         """Probe register links exposed from the current login/auth page."""
@@ -1668,6 +1879,7 @@ class MainAgent:
             return
 
         print("  DiscoveredFeatureAgent: 发现功能深度测试 - 逐个进入主要功能页并断言页面特征")
+        print("  ExplorerAgent: 每个功能页都会重新分析页面元素、功能入口和建议测试点")
         self._nested_feature_seen = set()
         for candidate in candidates:
             label = candidate.get("label", "")
@@ -1688,8 +1900,17 @@ class MainAgent:
                 print(f"      ✗ 页面异常: {broken_reason}")
                 continue
 
+            analysis = await self._report_snapshot_analysis(
+                snapshot_data,
+                indent="      ",
+                label=f"{feature}: {label}",
+                include_header=True,
+            )
             verdict = await self._inspect_deep_feature_page(candidate, snapshot_data)
-            self._append_flow_result(results, feature, verdict["status"], verdict["reason"], verdict.get("data", {}))
+            verdict_data = verdict.get("data", {})
+            if analysis:
+                verdict_data["page_analysis"] = analysis
+            self._append_flow_result(results, feature, verdict["status"], verdict["reason"], verdict_data)
             marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
             print(f"      {marker} {verdict['reason']}")
             await self._run_nested_feature_checks(candidate, snapshot_data, results)
@@ -1817,10 +2038,210 @@ class MainAgent:
                 print(f"          ✗ 页面异常: {broken_reason}")
                 continue
 
+            analysis = await self._report_snapshot_analysis(
+                child_data,
+                indent="          ",
+                label=f"{parent_feature}/{feature}: {label}",
+                include_header=True,
+            )
             verdict = await self._inspect_deep_feature_page(child, child_data)
-            self._append_flow_result(results, f"{parent_feature}/{feature}", verdict["status"], verdict["reason"], verdict.get("data", {}))
+            verdict_data = verdict.get("data", {})
+            if analysis:
+                verdict_data["page_analysis"] = analysis
+            self._append_flow_result(results, f"{parent_feature}/{feature}", verdict["status"], verdict["reason"], verdict_data)
             marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
             print(f"          {marker} {verdict['reason']}")
+
+    async def _run_recursive_feature_exploration(self, max_depth: int = 2, max_pages: int = 30) -> None:
+        """Explore the page tree as a bounded feature graph and test each page."""
+        max_depth = max(0, min(int(max_depth or 0), 4))
+        max_pages = max(1, min(int(max_pages or 1), 80))
+        candidates = self._deep_feature_candidates()
+        if not candidates:
+            print("\n[递归功能探索]")
+            print("  RecursiveExplorerAgent: 暂时没有可深入探索的站内功能入口")
+            return
+
+        print("\n[递归功能探索]")
+        print(f"  RecursiveExplorerAgent: 最大深度 {max_depth}，页面上限 {max_pages}，自动跳过重复公共导航和高风险路径")
+
+        root_url = self.context.current_url or getattr(self.page, "url", "")
+        original_url = root_url
+        queue: List[Dict[str, Any]] = []
+        for candidate in candidates[:max_pages]:
+            queue.append({
+                **candidate,
+                "depth": 1,
+                "parent_id": "root",
+                "path": ["首页", candidate.get("label") or candidate.get("feature") or candidate.get("href", "")],
+            })
+
+        visited: set[str] = {self._normalize_feature_url(root_url)}
+        graph = {
+            "root": root_url,
+            "max_depth": max_depth,
+            "max_pages": max_pages,
+            "nodes": [{"id": "root", "label": "首页", "feature": "root", "url": root_url, "depth": 0}],
+            "edges": [],
+            "paths": [],
+        }
+        results: List[Dict[str, Any]] = []
+
+        while queue and len(graph["nodes"]) - 1 < max_pages:
+            item = queue.pop(0)
+            href = item.get("href", "")
+            normalized = self._normalize_feature_url(href)
+            if not normalized or normalized in visited:
+                continue
+            if self._should_skip_recursive_feature(item, depth=item.get("depth", 1)):
+                continue
+            visited.add(normalized)
+
+            label = item.get("label") or self._label_from_href(href)
+            feature = item.get("feature") or self._classify_deep_feature(label, href) or "功能页"
+            depth = int(item.get("depth") or 1)
+            print(f"  - 深度{depth} {feature}: {label} -> {href}")
+            nav = await self.executor.navigate(href)
+            if not nav.ok:
+                self._append_flow_result(results, f"递归探索/{feature}", "failed", nav.reason, {"href": href, "depth": depth})
+                print(f"    ✗ 打开失败: {nav.reason}")
+                continue
+
+            snapshot = await self.executor.get_snapshot()
+            snapshot_data = snapshot.data if snapshot.ok else {}
+            broken_reason = self._page_broken_reason(snapshot_data)
+            node_id = f"n{len(graph['nodes'])}"
+            path = [part for part in (item.get("path") or [label]) if part]
+            graph["nodes"].append({
+                "id": node_id,
+                "label": label[:80],
+                "feature": feature,
+                "url": snapshot_data.get("url") or href,
+                "depth": depth,
+                "status": "failed" if broken_reason else "visited",
+            })
+            graph["edges"].append({
+                "from": item.get("parent_id") or "root",
+                "to": node_id,
+                "label": label[:80],
+            })
+            graph["paths"].append(" -> ".join(path))
+
+            if broken_reason:
+                self._append_flow_result(results, f"递归探索/{feature}", "failed", broken_reason, {"href": href, "depth": depth})
+                print(f"    ✗ 页面异常: {broken_reason}")
+                continue
+
+            analysis = await self._report_snapshot_analysis(
+                snapshot_data,
+                indent="    ",
+                label=f"递归/{feature}: {label}",
+                include_header=True,
+            )
+            verdict = await self._inspect_deep_feature_page(item, snapshot_data)
+            data = verdict.get("data", {})
+            data.update({"depth": depth, "path": path, "page_analysis": analysis})
+            self._append_flow_result(results, f"递归探索/{feature}", verdict["status"], verdict["reason"], data)
+            marker = "✓" if verdict["status"] == "passed" else ("!" if verdict["status"] == "blocked" else "✗")
+            print(f"    {marker} {verdict['reason']}")
+
+            if depth < max_depth and len(graph["nodes"]) - 1 < max_pages:
+                children = self._recursive_child_candidates(item, snapshot_data, depth)
+                for child in children:
+                    child_href = child.get("href", "")
+                    child_norm = self._normalize_feature_url(child_href)
+                    if not child_norm or child_norm in visited:
+                        continue
+                    queue.append({
+                        **child,
+                        "depth": depth + 1,
+                        "parent_id": node_id,
+                        "path": [*path, child.get("label") or child.get("feature") or child_href],
+                    })
+
+        self.context.site_map["feature_graph"] = graph
+        self.context.add_tested_feature("递归功能探索")
+        passed = sum(1 for item in results if item.get("status") == "passed")
+        blocked = sum(1 for item in results if item.get("status") == "blocked")
+        failed = sum(1 for item in results if item.get("status") == "failed")
+        self.context.add_event("agent", "递归功能探索完成", {
+            "result_type": "success" if failed == 0 else "partial",
+            "passed": passed,
+            "blocked": blocked,
+            "failed": failed,
+            "graph": graph,
+            "results": results,
+        })
+        print("  功能图路径:")
+        for path in graph["paths"][:20]:
+            print(f"    - {path}")
+        print(f"  ✓ 递归功能探索完成: 页面 {len(graph['nodes']) - 1}，通过 {passed} / 阻塞 {blocked} / 失败 {failed}")
+
+        if original_url and getattr(self.page, "url", "") != original_url:
+            try:
+                await self.executor.navigate(original_url)
+                self.context.add_page(original_url)
+            except Exception:
+                pass
+
+    def _recursive_child_candidates(self, parent: Dict[str, str], snapshot: Dict[str, Any], depth: int) -> List[Dict[str, str]]:
+        parent_feature = parent.get("feature", "")
+        parent_href = parent.get("href", "") or snapshot.get("url") or self.context.current_url
+        elements = snapshot.get("elements") or []
+        candidates: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for element in elements:
+            href = element.get("href") or ""
+            label = self._clean_nested_label(element)
+            if not href or not label:
+                continue
+            resolved = urljoin(parent_href, href)
+            if self._is_unsafe_feature_href(label, resolved) or not self._same_origin(parent_href, resolved):
+                continue
+            if self._is_common_navigation_label(label, resolved) and depth >= 1:
+                continue
+            normalized = self._normalize_feature_url(resolved)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            feature = self._classify_deep_feature(label, resolved) or self._classify_nested_feature(parent_feature, label, resolved) or "子功能"
+            if feature in {"博客列表"} and depth >= 1:
+                continue
+            candidates.append({"label": label[:80], "href": resolved, "feature": feature})
+
+        candidates.sort(key=lambda item: (self._nested_priority(item), item["href"]))
+        return candidates[:8]
+
+    def _normalize_feature_url(self, url: str) -> str:
+        if not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+            path = parsed.path.rstrip("/") or "/"
+            return f"{parsed.scheme}://{parsed.netloc}{path}"
+        except Exception:
+            return url.split("#")[0].rstrip("/")
+
+    def _is_common_navigation_label(self, label: str, href: str) -> bool:
+        blob = f"{label} {href}".lower().strip()
+        label_clean = re.sub(r"\s+", "", label or "")
+        common_exact = {"首页", "主页", "home", "博客", "blog", "关于", "about", "登录", "login"}
+        if label_clean.lower() in common_exact:
+            return True
+        try:
+            path = urlparse(href).path.rstrip("/")
+        except Exception:
+            path = ""
+        return path in {"", "/", "/blog", "/about", "/login"}
+
+    def _should_skip_recursive_feature(self, item: Dict[str, Any], depth: int) -> bool:
+        label = item.get("label", "")
+        href = item.get("href", "")
+        if self._is_unsafe_feature_href(label, href):
+            return True
+        if depth > 1 and self._is_common_navigation_label(label, href):
+            return True
+        return False
 
     def _nested_feature_candidates(self, parent: Dict[str, str], snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
         parent_feature = parent.get("feature", "")
@@ -2039,6 +2460,8 @@ class MainAgent:
         if not button:
             return None
 
+        before_snapshot = await self.executor.get_snapshot()
+        before_text = before_snapshot.data.get("text", "") if before_snapshot.ok else ""
         target_input = inputs[0]
         fill = await self.executor.fill(ref=target_input.get("ref", ""), description="工具输入框", text="test")
         if not fill.ok:
@@ -2058,14 +2481,27 @@ class MainAgent:
 
         await self.executor.wait(0.4)
         snapshot = await self.executor.get_snapshot()
-        text_length = len(snapshot.data.get("text", "")) if snapshot.ok else 0
+        after_text = snapshot.data.get("text", "") if snapshot.ok else ""
+        text_length = len(after_text)
+        changed = after_text != before_text
+        if not changed:
+            return {
+                "status": "blocked",
+                "reason": "工具页控件可交互，但触发后页面内容没有明显变化，无法确认输出结果",
+                "data": {
+                    "tool_probe": "no_visible_output_change",
+                    "button_text": button.get("text", ""),
+                    "post_action_text_length": text_length,
+                },
+            }
         return {
             "status": "passed",
-            "reason": "工具页可交互：已填入安全测试值 test 并触发安全本地按钮",
+            "reason": "工具页可交互：已填入安全测试值 test，触发安全本地按钮后检测到页面输出/状态变化",
             "data": {
                 "tool_probe": "clicked_safe_button",
                 "button_text": button.get("text", ""),
                 "post_action_text_length": text_length,
+                "output_changed": changed,
             },
         }
 
@@ -2541,6 +2977,65 @@ class MainAgent:
         print(f"  CSV/Excel: {paths['csv']}")
         print(f"  Excel: {paths['xlsx']}")
 
+    async def _auto_save_suite_test_cases(self) -> None:
+        """Persist the current suite plan as reusable cases for regression."""
+        if not self.context.test_plan:
+            return
+        name = f"{self.context.session_name}-full-suite"
+        if any(item.get("name") == name for item in self.context.test_cases):
+            return
+        try:
+            cases = self.case_manager.from_plan(self.context.test_plan, module=self.context.current_title or "Web")
+            paths = self.case_manager.save(name, cases)
+        except Exception as e:
+            print(f"  ! 自动沉淀测试用例失败: {e}")
+            return
+        record = {
+            "name": name,
+            "total": len(cases),
+            "paths": paths,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "full_suite",
+        }
+        self.context.test_cases.append(record)
+        self.context.artifacts.extend(paths.values())
+        self.context.add_event("agent", "全量测试用例已沉淀", record)
+        print(f"  ✓ 已沉淀测试用例: {name} ({len(cases)} 条)")
+
+    def _record_full_suite_summary(self, profile: Dict[str, Any]) -> None:
+        events = self.context.events
+        flow_results = self._collect_flow_results_from_events(events)
+        passed = sum(1 for item in flow_results if item.get("status") == "passed" or item.get("ok") is True)
+        blocked = sum(1 for item in flow_results if item.get("status") == "blocked")
+        failed = sum(1 for item in flow_results if item.get("status") == "failed" or item.get("ok") is False)
+        graph = (self.context.site_map or {}).get("feature_graph") or {}
+        summary = {
+            "mode": profile.get("mode"),
+            "label": profile.get("label"),
+            "passed": passed,
+            "blocked": blocked,
+            "failed": failed,
+            "page_coverage": len(graph.get("nodes") or self.context.page_history),
+            "feature_paths": graph.get("paths", [])[:50],
+            "not_tested_reasons": [
+                item.get("reason", "")
+                for item in flow_results
+                if item.get("status") == "blocked"
+            ][:30],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.context.suite_summaries.append(summary)
+        self.context.add_event("agent", "全量测试汇总", summary)
+
+    def _collect_flow_results_from_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for event in events or []:
+            data = event.get("data") or {}
+            for item in data.get("results") or []:
+                if isinstance(item, dict):
+                    results.append(item)
+        return results
+
     def _list_managed_test_cases(self):
         items = self.case_manager.list_cases()
         print("\n[用例列表]")
@@ -2808,6 +3303,56 @@ class MainAgent:
             print("  最近接口:")
             for record in summary["recent_api"][-8:]:
                 print(f"    - {record.get('status')} | {record.get('duration')} ms | {record.get('url')}")
+        api_contract = self._derive_api_contract_checks(summary)
+        if api_contract["endpoints"]:
+            self.context.api_runs.append(api_contract)
+            print("  接口断言候选:")
+            for endpoint in api_contract["endpoints"][:6]:
+                marker = "✓" if endpoint.get("ok") else "✗"
+                print(
+                    f"    {marker} {endpoint.get('method')} {endpoint.get('path')} | "
+                    f"status={endpoint.get('status')} | avg={endpoint.get('avg_duration')}ms"
+                )
+
+    def _derive_api_contract_checks(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for record in summary.get("recent_api") or []:
+            url = record.get("url", "")
+            try:
+                parsed = urlparse(url)
+                path = parsed.path or "/"
+            except Exception:
+                path = url.split("?")[0]
+            key = f"{record.get('method', 'GET')} {path}"
+            grouped.setdefault(key, []).append(record)
+
+        endpoints = []
+        for key, records in grouped.items():
+            method, path = key.split(" ", 1)
+            statuses = [int(item.get("status") or 0) for item in records]
+            durations = [float(item.get("duration") or 0) for item in records]
+            ok = bool(statuses) and all(200 <= status < 400 for status in statuses)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "status": sorted(set(statuses)),
+                "ok": ok,
+                "count": len(records),
+                "avg_duration": round(sum(durations) / max(1, len(durations)), 2),
+                "assertions": [
+                    "状态码必须为 2xx/3xx",
+                    "接口平均耗时建议低于 1000ms",
+                    "失败时需要检查响应结构和错误提示",
+                ],
+            })
+        endpoints.sort(key=lambda item: (not item["ok"], -item["count"], item["path"]))
+        return {
+            "name": "network-derived-api-contracts",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "passed": sum(1 for item in endpoints if item["ok"]),
+            "failed": sum(1 for item in endpoints if not item["ok"]),
+            "endpoints": endpoints[:30],
+        }
 
     def _generate_test_data(self, text: str):
         kind = "comment"
@@ -3348,23 +3893,76 @@ jobs:
             print("  无法获取页面信息")
             return
 
-        elements = snapshot_result.data.get("elements", [])
-        if not elements:
-            print("  页面元素为空，可能还在加载")
+        analysis = await self._report_snapshot_analysis(snapshot_result.data, indent="  ")
+        if not analysis:
             return
 
-        self._remember_page_features(snapshot_result.data)
-        print(f"\n  页面元素: {len(elements)} 个")
+        print()
 
-        # AI 分析页面功能
+    async def _report_snapshot_analysis(
+        self,
+        snapshot: Dict[str, Any],
+        indent: str = "  ",
+        label: str = "",
+        include_header: bool = False,
+    ) -> Dict[str, Any]:
+        """Print an ExplorerAgent-style semantic analysis for a page snapshot."""
+        elements = snapshot.get("elements", [])
+        if not elements:
+            print(f"{indent}页面元素为空，可能还在加载")
+            return {}
+
+        self._remember_page_features(snapshot)
+        if include_header:
+            title = label.strip() or snapshot.get("title") or snapshot.get("url") or "当前页面"
+            print(f"{indent}ExplorerAgent: 分析“{title[:80]}”页面")
+        print(f"{indent}页面元素: {len(elements)} 个")
+
+        lines, source = await self._summarize_snapshot_analysis(snapshot)
+        print()
+        for line in lines[:6]:
+            if line.strip():
+                print(f"{indent}{line.strip()}")
+
+        analysis = {
+            "source": source,
+            "url": snapshot.get("url") or self.context.current_url or getattr(self.page, "url", ""),
+            "title": snapshot.get("title", ""),
+            "element_count": len(elements),
+            "summary": lines[:6],
+        }
+        self.context.add_event(
+            "agent",
+            f"页面语义分析: {label or analysis['url']}",
+            {
+                "result_type": "analysis",
+                "source": source,
+                "url": analysis["url"],
+                "element_count": len(elements),
+                "summary": lines[:6],
+            },
+        )
+
+        self._record_discovered_features_from_snapshot(snapshot)
+        return analysis
+
+    async def _summarize_snapshot_analysis(self, snapshot: Dict[str, Any]) -> tuple[List[str], str]:
+        """Summarize page type, entries and recommended tests with AI plus a rule fallback."""
+        elements = snapshot.get("elements", [])
         elements_text = "\n".join([
-            f"- <{e['tag']}> '{e.get('text','')[:30]}' placeholder='{e.get('placeholder','')}'"
-            for e in elements[:25]
+            self._format_element_for_analysis(element)
+            for element in elements[:35]
         ])
+        url = snapshot.get("url") or self.context.current_url or getattr(self.page, "url", "")
+        title = snapshot.get("title", "")
+        text = (snapshot.get("text") or "")[:1000]
 
         prompt = f"""分析以下页面，识别可测试的功能。
 
-页面: {self.context.current_url}
+页面: {url}
+标题: {title}
+可见文本摘要:
+{text}
 元素:
 {elements_text}
 
@@ -3375,17 +3973,138 @@ jobs:
 
 中文回答，简洁明了，3-5行。"""
 
-        try:
-            response = await self.ai_client.complete(prompt, "")
-            print()
-            for line in response.strip().split("\n")[:6]:
-                if line.strip():
-                    print(f"  {line.strip()}")
-        except Exception as e:
-            print(f"  AI 分析失败: {e}")
+        if getattr(self, "ai_client", None):
+            try:
+                response = await self.ai_client.complete(prompt, "")
+                lines = [line.strip() for line in response.strip().split("\n") if line.strip()]
+                if lines:
+                    return lines[:6], "AI"
+            except Exception:
+                pass
 
-        # 记录发现的登录功能
-        for e in elements:
+        return self._fallback_page_analysis_lines(snapshot), "规则兜底"
+
+    def _format_element_for_analysis(self, element: Dict[str, Any]) -> str:
+        bits = [
+            f"- {element.get('ref', '')} <{element.get('tag', '')}>",
+            f"text='{(element.get('text') or '')[:60]}'",
+        ]
+        for key in ("placeholder", "label", "ariaLabel", "href", "type", "role"):
+            value = element.get(key)
+            if value:
+                bits.append(f"{key}='{str(value)[:100]}'")
+        return " ".join(bits)
+
+    def _fallback_page_analysis_lines(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Rule-based page analysis used when AI is unavailable or times out."""
+        url = snapshot.get("url") or self.context.current_url or getattr(self.page, "url", "")
+        title = snapshot.get("title", "")
+        elements = snapshot.get("elements") or []
+        text = snapshot.get("text") or ""
+        blob = f"{url} {title} {text[:1200]} " + " ".join(
+            " ".join(str(element.get(key, "")) for key in ("text", "placeholder", "label", "ariaLabel", "href"))
+            for element in elements[:80]
+        )
+        lower_blob = blob.lower()
+        path = urlparse(url or "").path.lower()
+
+        page_type = "通用内容/功能页面"
+        if any(term in lower_blob for term in ["登录", "username", "password", "login"]) or "/login" in path:
+            page_type = "登录/认证页面"
+        elif any(term in lower_blob for term in ["注册", "register", "signup"]) or "/register" in path:
+            page_type = "注册页面"
+        elif "/search" in path or "搜索" in lower_blob or "search" in lower_blob:
+            page_type = "搜索/检索页面"
+        elif "/blog/" in path:
+            page_type = "文章详情页"
+        elif "/blog" in path or any(term in lower_blob for term in ["文章", "博客", "阅读全文"]):
+            page_type = "博客/文章列表页"
+        elif "/archive" in path or "归档" in lower_blob:
+            page_type = "归档聚合页"
+        elif "/tags" in path or "标签" in lower_blob:
+            page_type = "标签筛选页"
+        elif "/guestbook" in path or any(term in lower_blob for term in ["留言", "评论", "comment"]):
+            page_type = "留言/评论页面"
+        elif "/tools" in path or any(term in lower_blob for term in ["工具箱", "编码", "解码", "格式化", "hash"]):
+            page_type = "工具箱/实用工具页面"
+        elif "/resources" in path or "资源" in lower_blob:
+            page_type = "资源导航页面"
+        elif "/projects" in path or "项目" in lower_blob:
+            page_type = "项目展示页面"
+        elif "/games" in path or "游戏" in lower_blob:
+            page_type = "游戏功能页面"
+        elif "/photos" in path or "相册" in lower_blob:
+            page_type = "相册/媒体页面"
+
+        entries = self._extract_snapshot_feature_entries(snapshot)
+        entry_text = "、".join(entries[:10]) if entries else "未发现明显入口，可继续检查链接、按钮和表单"
+        recommended = self._recommend_tests_for_snapshot(page_type, entries, snapshot)
+
+        return [
+            f"1. 页面类型：{page_type}",
+            f"2. 发现的功能入口列表：{entry_text}",
+            f"3. 建议优先测试的功能：{recommended}",
+        ]
+
+    def _extract_snapshot_feature_entries(self, snapshot: Dict[str, Any]) -> List[str]:
+        elements = snapshot.get("elements") or []
+        entries: List[str] = []
+        seen: set[str] = set()
+        for element in elements:
+            label = " ".join(str(element.get(key, "")) for key in ("text", "placeholder", "label", "ariaLabel", "title")).strip()
+            label = re.sub(r"\s+", " ", label)
+            href = element.get("href") or ""
+            if not label:
+                label = self._label_from_href(href) if href else ""
+            if not label or len(label) > 48:
+                continue
+            tag = element.get("tag", "")
+            role = element.get("role", "")
+            if not href and tag not in ("button", "input", "textarea", "select") and role != "button":
+                continue
+            key = label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(label)
+            if len(entries) >= 12:
+                break
+        return entries
+
+    def _recommend_tests_for_snapshot(self, page_type: str, entries: List[str], snapshot: Dict[str, Any]) -> str:
+        elements = snapshot.get("elements") or []
+        inputs = [element for element in elements if element.get("tag") in ("input", "textarea", "select")]
+        buttons = [element for element in elements if element.get("tag") == "button" or element.get("role") == "button"]
+        links = [element for element in elements if element.get("href")]
+
+        if "登录" in page_type:
+            return "字段识别、正确/错误凭证、token/cookie、错误提示和登录后入口"
+        if "注册" in page_type:
+            return "必填校验、重复账号、密码规则、注册前置风险和登录跳转"
+        if "搜索" in page_type:
+            return "正常关键词、无结果关键词、结果相关性、结果链接可打开和接口耗时"
+        if "文章详情" in page_type:
+            return "正文完整性、目录锚点、代码块/图片、点赞/评论前置条件"
+        if "博客/文章列表" in page_type:
+            return "列表加载、文章详情跳转、分页/筛选、搜索入口和空状态"
+        if "归档" in page_type or "标签" in page_type:
+            return "分类/时间筛选、筛选结果、文章跳转和无结果提示"
+        if "留言" in page_type or "评论" in page_type:
+            return "未登录提示、登录后表单、内容校验和提交后列表断言"
+        if "工具" in page_type:
+            return "输入框、按钮可用性、安全本地转换、异常输入和结果展示"
+        if "资源" in page_type or "项目" in page_type:
+            return "入口可访问、外链安全、详情页内容、按钮跳转和慢资源"
+        if "游戏" in page_type:
+            return "入口加载、开始/重置按钮、交互反馈、键盘/移动端操作"
+        if inputs or buttons:
+            return f"表单字段 {len(inputs)} 个、按钮 {len(buttons)} 个的可用性、校验和状态变化"
+        if links:
+            return f"主要链接 {min(len(links), 10)} 个的跳转、404、空白页和页面内容一致性"
+        return "页面内容完整性、可访问性、性能和异常状态"
+
+    def _record_discovered_features_from_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        for e in snapshot.get("elements") or []:
             text = (e.get("text") or "").lower()
             if any(kw in text for kw in ["登录", "login", "注册", "register"]):
                 self.context.add_discovered_feature("登录/注册")
@@ -3396,8 +4115,6 @@ jobs:
             if any(kw in text for kw in ["搜索", "search"]):
                 self.context.add_discovered_feature("搜索")
                 break
-
-        print()
 
     # ─── 测试任务 ─────────────────────────────────────────────────────────────
 
@@ -3697,11 +4414,16 @@ jobs:
         if action_type == "navigate":
             if not action.url:
                 return ExecutorResult(type=ResultType.FAILURE, reason="未提供 URL")
+            loop_reason = self._navigation_loop_reason(action.url)
+            if loop_reason:
+                return ExecutorResult(type=ResultType.FAILURE, reason=loop_reason, data={"url": action.url})
             result = await self._handle_navigate(action.url)
             if result:
                 self._record_action_ir(action, result)
             if result and not result.ok:
                 return result
+            if result and result.ok:
+                self._record_navigation_visit(result.data.get("url", action.url))
             return None
 
         if action_type == "click":
@@ -3889,20 +4611,23 @@ jobs:
 
     async def _guard_risky_click(self, action: AgentAction) -> Optional[ExecutorResult]:
         """Prevent accidental destructive actions during exploratory testing."""
-        if not self._is_publish_click(action):
+        risk = self._click_risk_category(action)
+        if not risk:
             return None
 
-        current_url = (self.context.current_url or getattr(self.page, "url", "") or "").lower()
-        if not any(path in current_url for path in ["/dashboard/write", "/write", "/editor"]):
+        if risk == "login_submit":
             return None
 
-        if self._current_task_confirms_real_publish():
+        if risk == "publish" and self._current_task_confirms_real_publish():
+            return None
+
+        if getattr(self, "_allow_state_changing_actions", False) and risk not in {"delete", "payment", "logout"}:
             return None
 
         return ExecutorResult(
             type=ResultType.DONE,
-            data={"publish_blocked": True},
-            summary="已完成写文章发布前流程验证；为避免创建真实内容，已拦截“发布”动作。若要真正发布，请明确说“确认发布测试文章”。",
+            data={"risky_click_blocked": True, "publish_blocked": risk == "publish", "risk_category": risk},
+            summary=f"已拦截高风险动作“{risk}”：为避免修改真实数据，本次只验证到提交前。若要真实执行，请使用破坏性/允许状态变更模式并明确确认。",
         )
 
     def _is_publish_click(self, action: AgentAction) -> bool:
@@ -3916,6 +4641,38 @@ jobs:
             action.expected,
         ]).lower()
         return any(term in text for term in ["发布", "提交", "提交文章", "publish", "submit post", "post article"])
+
+    def _click_risk_category(self, action: AgentAction) -> str:
+        if action.type != "click":
+            return ""
+        text = " ".join([
+            action.description,
+            action.target_desc,
+            action.target_ref,
+            action.text,
+            action.expected,
+        ]).lower()
+        current_url = (self.context.current_url or getattr(self.page, "url", "") or "").lower()
+
+        if self._action_looks_like_login_submit(action):
+            return "login_submit"
+        if any(term in text for term in ["删除", "移除", "delete", "remove"]):
+            return "delete"
+        if any(term in text for term in ["支付", "付款", "购买", "下单", "pay", "checkout", "order"]):
+            return "payment"
+        if any(term in text for term in ["退出", "注销", "logout", "sign out"]):
+            return "logout"
+        if any(term in text for term in ["上传", "upload", "发送邮件", "send email"]):
+            return "external_side_effect"
+        if any(term in text for term in ["发布", "提交文章", "publish", "submit post", "post article"]):
+            return "publish"
+        if any(term in text for term in ["注册", "register", "signup", "sign up"]) and not self._url_looks_like_auth_page(current_url):
+            return "register_submit"
+        if any(term in text for term in ["评论", "留言", "comment", "提交"]) and any(term in current_url for term in ["/guestbook", "/comment", "/blog/"]):
+            return "comment_submit"
+        if "提交" in text and any(term in current_url for term in ["/write", "/editor", "/register", "/signup"]):
+            return "submit"
+        return ""
 
     def _current_task_confirms_real_publish(self) -> bool:
         text = (getattr(self, "_current_user_task_text", "") or "").lower()
@@ -3977,6 +4734,23 @@ jobs:
             location = current_url
         target = action.target_ref or action.target_desc or action.description or action.url or action.type
         return f"{action.type}|{location}|{target}".lower()
+
+    def _navigation_loop_reason(self, url: str) -> str:
+        normalized = self._normalize_feature_url(url)
+        if not normalized:
+            return ""
+        counts = getattr(self, "_url_visit_counts", {})
+        if counts.get(normalized, 0) >= 2:
+            return f"同一 URL 已重复进入 2 次仍未推进任务，停止避免循环: {normalized}"
+        return ""
+
+    def _record_navigation_visit(self, url: str) -> None:
+        normalized = self._normalize_feature_url(url)
+        if not normalized:
+            return
+        counts = getattr(self, "_url_visit_counts", {})
+        counts[normalized] = counts.get(normalized, 0) + 1
+        self._url_visit_counts = counts
 
     def _task_has_goal(self, goal_type: str) -> bool:
         state = getattr(self, "_current_task_state", None)
@@ -4053,6 +4827,17 @@ jobs:
             "href": href,
             "last_seen": datetime.now().isoformat(timespec="seconds"),
         }
+        memory = getattr(self, "locator_memory", None)
+        if memory:
+            try:
+                memory.record(self.context.current_url or getattr(self.page, "url", ""), feature, {
+                    "text": label,
+                    "href": href,
+                    "tag": "a",
+                    "role": "link",
+                })
+            except Exception:
+                pass
 
     def _check_task_guardrails(self) -> str:
         if self._task_action_count > self._max_actions_per_task:
@@ -4312,9 +5097,6 @@ jobs:
             if self.context.reports:
                 return {"done": True, "summary": "测试报告已生成"}
 
-        if not self._has_post_navigation_task(task):
-            return {"done": True, "summary": "当前任务已执行"}
-
         snapshot = await self.executor.get_snapshot()
         if snapshot.type != ResultType.SUCCESS:
             return {
@@ -4325,6 +5107,9 @@ jobs:
 
         if self._current_task_state:
             return self.verifier.evaluate_task(self._current_task_state, snapshot.data)
+
+        if not self._has_post_navigation_task(task):
+            return {"done": True, "summary": "当前任务已执行"}
 
         page_text = (snapshot.data.get("text") or "").lower()
         current_url = snapshot.data.get("url") or self.context.current_url or getattr(self.page, "url", "")
@@ -4585,9 +5370,10 @@ TestForge CLI 使用指南
   测试当前页面所有已知功能
 
   全量测试会做:
-  测试计划、站点地图、入口冒烟、发现功能深度检查、二级功能入口检查、安全本地工具交互探针、搜索/文章/登录/评论前置流、
-  页面质量、安全、无障碍、性能、低压压测、网络/API摘要、HTML/JSON报告。
-  默认不会自动提交注册、评论、发文章、删除、支付等会产生真实数据或风险的动作。
+  冒烟/标准/深度/破坏性模式、测试计划、站点地图、递归功能图、入口冒烟、一级/二级页面语义分析、
+  发现功能深度检查、安全本地工具交互探针、搜索/文章/登录/评论/点赞前置流、页面质量、安全、无障碍、
+  性能、低压压测、网络/API断言候选、用例沉淀、HTML/JSON增强报告。
+  默认不会自动提交注册、评论、发文章、删除、支付等会产生真实数据或风险的动作；要真实提交需明确说“破坏性/允许状态变更”。
 
 测试工程师工具:
   测试计划                         - 生成测试矩阵
